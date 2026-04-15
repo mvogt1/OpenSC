@@ -103,6 +103,7 @@ struct _sc_driver_entry {
 
 // clang-format off
 static const struct _sc_driver_entry internal_card_drivers[] = {
+	{ "jcop",       (void *(*)(void)) sc_get_jcop_driver },
 	/* The card handled by skeid shares the ATR with other cards running CardOS 5.4.
 	 * In order to prevent the cardos driver from matching skeid cards, skeid driver
 	 * precedes cardos and matches no other CardOS 5.4 card. */

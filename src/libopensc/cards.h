@@ -284,6 +284,12 @@ enum {
 
 	/* Serbian cards (CardEdge PKI applet) */
 	SC_CARD_TYPE_SRBEID_BASE = 44000,
+
+	/* JCOP4 cards with BlueZ-Applet */
+        SC_CARD_TYPE_BLUEZ_APPLET = 43000,
+        SC_CARD_TYPE_BLUEZ_APPLET_V2_STD = 43001,
+        SC_CARD_TYPE_BLUEZ_APPLET_V4_7 = 43002,
+
 };
 
 extern sc_card_driver_t *sc_get_default_driver(void);
@@ -330,6 +336,7 @@ extern sc_card_driver_t *sc_get_eoi_driver(void);
 extern sc_card_driver_t *sc_get_dtrust_driver(void);
 extern sc_card_driver_t *sc_get_lteid_driver(void);
 extern sc_card_driver_t *sc_get_srbeid_driver(void);
+extern sc_card_driver_t *sc_get_jcop_driver(void);
 
 #ifdef __cplusplus
 }
