@@ -53,7 +53,7 @@ static struct sc_card_driver jcop_drv = {
 #define SELECTING_ABS 0x80
 #define SELECTING_VIA_APPDF 0x100
 
-struct jcop_private_data 
+typedef struct jcop_private_data_s 
 {
      struct sc_file *virtmf;
      struct sc_file *virtdir;
@@ -62,12 +62,16 @@ struct jcop_private_data
      int invalid_senv;
      size_t nfiles;
      u8 *filelist;
-};
-#define DRVDATA(card)   ((struct jcop_private_data *) ((card)->drv_data))
+
+     int key_ref;
+     int algorithm_flags;
+     int algorithm;
+} jcop_private_data_t ;
+#define DRVDATA(card)   ((jcop_private_data_t *) ((card)->drv_data))
 
 static int jcop_finish(struct sc_card *card)
 {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      if (drvdata) {
 	  sc_file_free(drvdata->virtmf);
 	  sc_file_free(drvdata->virtdir);
@@ -115,14 +119,14 @@ static unsigned char ef_dir_contents[128] = {
 
 static int jcop_init(struct sc_card *card)
 {
-     struct jcop_private_data *drvdata;
+     jcop_private_data_t *drvdata;
      struct sc_file *f;
      int flags;
      
-     drvdata=malloc(sizeof(struct jcop_private_data));
+     drvdata=malloc(sizeof(jcop_private_data_t));
      if (!drvdata)
 	  return SC_ERROR_OUT_OF_MEMORY;
-     memset(drvdata, 0, sizeof(struct jcop_private_data));
+     memset(drvdata, 0, sizeof(jcop_private_data_t));
      
      sc_format_path("A000:0000:6350:4B43:532D:3135", &drvdata->aid);
      drvdata->aid.type = SC_PATH_TYPE_DF_NAME;
@@ -217,7 +221,7 @@ static int jcop_get_default_key(struct sc_card *card,
 static int jcop_select_file(struct sc_card *card, const struct sc_path *path,
 			    struct sc_file **file)
 {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      int r,selecting;
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
@@ -330,7 +334,7 @@ static int jcop_select_file(struct sc_card *card, const struct sc_path *path,
 
 static int jcop_read_binary(struct sc_card *card, unsigned int idx,
 			    u8 * buf, size_t count, unsigned long* flags) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
      struct sc_file  *tmpfile;
@@ -366,7 +370,7 @@ static int jcop_read_binary(struct sc_card *card, unsigned int idx,
 }
 
 static int jcop_list_files(struct sc_card *card, u8 *buf, size_t buflen) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
      struct sc_file  *tmpfile;
@@ -436,7 +440,7 @@ static int sa_to_acl(struct sc_file *file, unsigned int operation,
 
 static int jcop_process_fci(struct sc_card *card, struct sc_file *file,
 			    const u8 *buf, size_t buflen) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
      u8 *sa;
@@ -541,7 +545,7 @@ static int acl_to_ac_nibble(const struct sc_acl_entry *e)
 
 
 static int jcop_create_file(struct sc_card *card, struct sc_file *file) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      unsigned char sec_attr_data[3];
      int ops[6];
      int i, r;
@@ -589,7 +593,7 @@ static int jcop_create_file(struct sc_card *card, struct sc_file *file) {
 static int jcop_write_binary(struct sc_card *card,
 			unsigned int idx, const u8 *buf,
 			size_t count, unsigned long flags) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
 
@@ -606,7 +610,7 @@ static int jcop_update_binary(struct sc_card *card,
 			 unsigned int idx, const u8 *buf,
 			 size_t count, unsigned long flags) {
      
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
      if (drvdata->selected == SELECT_MF)
@@ -618,7 +622,7 @@ static int jcop_update_binary(struct sc_card *card,
 }
 
 static int jcop_delete_file(struct sc_card *card, const struct sc_path *path) {
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
      struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
      const struct sc_card_operations *iso_ops = iso_drv->ops;
 
@@ -631,6 +635,8 @@ static int jcop_delete_file(struct sc_card *card, const struct sc_path *path) {
 
 /* BlueZ doesn't support stored security environments. you have
    to construct one with SET every time */
+// OLD jcop 2(?) version replaced with jcop4 below
+/*
 static int jcop_set_security_env(struct sc_card *card,
                                     const struct sc_security_env *env,
                                     int se_num)
@@ -639,7 +645,7 @@ static int jcop_set_security_env(struct sc_card *card,
         u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
         u8 *p;
         int r;
-	struct jcop_private_data *drvdata=DRVDATA(card);
+	jcop_private_data_t *drvdata=DRVDATA(card);
 
         assert(card != NULL && env != NULL);
      struct sc_context *ctx = card->ctx;
@@ -668,9 +674,9 @@ static int jcop_set_security_env(struct sc_card *card,
                         return SC_ERROR_NOT_SUPPORTED;
                 }
                 tmp.algorithm_ref = 0x02;
-                /* potential FIXME: return an error, if an unsupported
-                 * pad or hash was requested, although this shouldn't happen.
-                 */
+                // potential FIXME: return an error, if an unsupported
+                // pad or hash was requested, although this shouldn't happen.
+                
                 if (tmp.algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1)
                         tmp.algorithm_ref |= 0x10;
                 if (tmp.algorithm_flags & SC_ALGORITHM_RSA_HASH_MD5)
@@ -706,7 +712,7 @@ static int jcop_set_security_env(struct sc_card *card,
 	}
 
         p = sbuf;
-	*p++ = 0x80;    /* algorithm reference */
+	*p++ = 0x80;    // algorithm reference 
 	*p++ = 0x01;
 	*p++ = env->algorithm_ref & 0xFF;
 
@@ -735,6 +741,171 @@ static int jcop_set_security_env(struct sc_card *card,
 	drvdata->invalid_senv=0;
 	return 0;
 }
+*/
+
+static int jcop4_set_security_env(sc_card_t *card,
+                                    const sc_security_env_t *env,
+                                    int se_num)
+{
+	struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
+     const struct sc_card_operations *iso_ops = iso_drv->ops;
+
+     struct sc_apdu apdu;
+	u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
+	u8 *p;
+	int r;
+	struct sc_context *ctx = card->ctx;
+	jcop_private_data_t *drvdata = DRVDATA(card);
+
+	assert(card != NULL && env != NULL);
+
+	LOG_FUNC_CALLED(ctx);
+	//printf("jcop_set_security_env\n");
+	// exit(1);
+     //r=myeid_set_security_env(card,env,se_num);
+     //return r;
+     drvdata->key_ref=-1;
+     if (env->flags & SC_SEC_ENV_KEY_REF_PRESENT && env->operation != SC_SEC_OPERATION_UNWRAP &&
+			env->operation != SC_SEC_OPERATION_WRAP &&
+			env->operation != SC_SEC_OPERATION_ENCRYPT_SYM &&
+			env->operation != SC_SEC_OPERATION_DECRYPT_SYM) {
+          drvdata->key_ref=env->key_ref[0] & 0xFF;
+		//printf("Storing key id:%d 0x%x\n",drvdata->key_ref,drvdata->key_ref);
+	}
+     //printf("ENC FLASG 0x%x ALGOS: %x JCOP ALGO FLAGS:%d\n",env->flags,env->algorithm, env->algorithm_flags);
+     drvdata->algorithm=env->algorithm;
+     drvdata->algorithm_flags = env->algorithm_flags;
+     if (env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS) {
+          printf("SC_ALGORITHM_RSA_PAD_PSS \n");
+     }
+
+     if (env->flags & SC_SEC_ENV_ALG_REF_PRESENT)	{
+          printf("SC_SEC_ENV_ALG_REF_PRESENT: %ld 0x%lx\n",env->algorithm_ref & 0xFF,env->algorithm_ref & 0xFF);
+          /*
+		*p++ = 0x80;	// algorithm reference 
+		*p++ = 0x01;
+		*p++ = env->algorithm_ref & 0xFF;
+          */
+	}
+     //exit(1);
+     if (drvdata->selected == SELECT_MF ||
+			drvdata->selected == SELECT_EFDIR) {
+		drvdata->invalid_senv = 1;
+		return 0;
+	}
+     r= iso_ops->set_security_env(card,env,se_num);
+     if (r == 0) {
+         drvdata->invalid_senv = 0; 
+     }
+     return r;
+
+	if (se_num)
+		SC_FUNC_RETURN(card->ctx, 1, SC_ERROR_INVALID_ARGUMENTS);
+	if (drvdata->selected == SELECT_MF ||
+			drvdata->selected == SELECT_EFDIR) {
+		drvdata->invalid_senv = 1;
+		return 0;
+	}
+
+	if (env->flags & SC_SEC_ENV_ALG_PRESENT) {
+		struct sc_security_env tmp;
+
+		tmp = *env;
+		tmp.flags &= ~SC_SEC_ENV_ALG_PRESENT;
+		tmp.flags |= SC_SEC_ENV_ALG_REF_PRESENT;
+		if (tmp.algorithm != SC_ALGORITHM_RSA) {
+			// LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+
+			sc_log(card->ctx, "Only RSA algorithm supported.\n");
+			return SC_ERROR_NOT_SUPPORTED;
+		}
+		if (!(env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PKCS1)) {
+
+			//                         LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+
+			sc_log(card->ctx, "Card requires RSA padding\n");
+			return SC_ERROR_NOT_SUPPORTED;
+		}
+		tmp.algorithm_ref = 0x02;
+		/* potential FIXME: return an error, if an unsupported
+		 * pad or hash was requested, although this shouldn't happen.
+		 */
+		if (tmp.algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1)
+			tmp.algorithm_ref |= 0x10;
+		if (tmp.algorithm_flags & SC_ALGORITHM_RSA_HASH_MD5)
+			tmp.algorithm_ref |= 0x20;
+		env = &tmp;
+	}
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0x22, 0xC1, 0);
+	switch (env->operation) {
+	case SC_SEC_OPERATION_DECIPHER:
+		apdu.p2 = 0xB8;
+		break;
+	case SC_SEC_OPERATION_SIGN:
+		apdu.p2 = 0xB6;
+		break;
+	default:
+		printf("Unknown Operation:%d %x\n", env->operation, env->operation);
+		return SC_ERROR_INVALID_ARGUMENTS;
+	}
+	apdu.le = 0;
+     
+	if (! (env->flags & SC_SEC_ENV_ALG_REF_PRESENT)) {
+          printf("NO env SC_SEC_ENV_ALG_REF_PRESENT\n");
+		//return SC_ERROR_INVALID_ARGUMENTS;
+	} else {
+          printf("FOUND env SC_SEC_ENV_ALG_REF_PRESENT\n");
+     }
+	if (! (env->flags & SC_SEC_ENV_FILE_REF_PRESENT) ) {
+          printf("NO env SC_SEC_ENV_FILE_REF_PRESENT\n");
+		//return SC_ERROR_INVALID_ARGUMENTS;
+     } else {
+          printf("FOUND env SC_SEC_ENV_FILE_REF_PRESENT\n");
+     }
+	if (env->flags & SC_SEC_ENV_KEY_REF_PRESENT) {
+          printf("FOUND env SC_SEC_ENV_FILE_REF_PRESENT\n");
+		if ( (env->key_ref_len > 1) || (env->key_ref[0] != 0) ) {
+               printf("env-3 len:0x%lx 0x%x\n",env->key_ref_len,env->key_ref[0]);
+			//return SC_ERROR_INVALID_ARGUMENTS;
+          }
+	} else {
+          printf("NO env SC_SEC_ENV_KEY_REF_PRESENT\n");
+     }
+     
+
+	p = sbuf;
+	*p++ = 0x80; /* algorithm reference */
+	*p++ = 0x01;
+	*p++ = env->algorithm_ref & 0xFF;
+
+	*p++ = 0x81;
+	*p++ = env->file_ref.len;
+	memcpy(p, env->file_ref.value, env->file_ref.len);
+	p += env->file_ref.len;
+
+	r = p - sbuf;
+	apdu.lc = r;
+	apdu.datalen = r;
+	apdu.data = sbuf;
+	apdu.resplen = 0;
+	r = sc_transmit_apdu(card, &apdu);
+	if (r) {
+		// sc_log(card->ctx, r, "APDU transmit failed");
+		LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+		return r;
+	}
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	if (r) {
+		LOG_TEST_RET(card->ctx, r, "Card returned error");
+		return r;
+	}
+	drvdata->invalid_senv = 0;
+	return 0;
+}
+
+// OLD jcop 2(?) version replaced with jcop4 below
+/*
 static int jcop_compute_signature(struct sc_card *card,
 				  const u8 * data, size_t datalen,
 				  u8 * out, size_t outlen) {
@@ -745,7 +916,7 @@ static int jcop_compute_signature(struct sc_card *card,
         struct sc_apdu apdu;
         u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
         u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
-	struct jcop_private_data *drvdata=DRVDATA(card);
+	jcop_private_data_t *drvdata=DRVDATA(card);
                
         assert(card != NULL && data != NULL && out != NULL);
      struct sc_context *ctx = card->ctx;
@@ -758,13 +929,13 @@ static int jcop_compute_signature(struct sc_card *card,
 	if (drvdata->invalid_senv)
 	     return sc_check_sw(card, 0x69, 0x88);
 
-        /* INS: 0x2A  PERFORM SECURITY OPERATION
-         * P1:  0x9E  Resp: Digital Signature
-         * P2:  0x9A  Cmd: Input for Digital Signature */
+        // INS: 0x2A  PERFORM SECURITY OPERATION
+        // P1:  0x9E  Resp: Digital Signature
+        // P2:  0x9A  Cmd: Input for Digital Signature 
         sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x2A, 0x9E,
                        0x9A);
         apdu.resp = rbuf;
-        apdu.resplen = sizeof(rbuf); /* FIXME */
+        apdu.resplen = sizeof(rbuf); // FIXME 
         apdu.le = 256;
 	if (datalen == 256) {
 	     apdu.p2 = data[0];
@@ -789,8 +960,46 @@ static int jcop_compute_signature(struct sc_card *card,
         }
         SC_FUNC_RETURN(card->ctx, 4, sc_check_sw(card, apdu.sw1, apdu.sw2));
 }
- 
+*/
 
+
+static int jcop4_compute_signature(sc_card_t *card,
+				  const u8 * data, size_t datalen,
+				  u8 * out, size_t outlen) {
+
+     int r;
+     struct sc_context *ctx = card->ctx;
+     struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
+     const struct sc_card_operations *iso_ops = iso_drv->ops;
+
+     
+     const u8* tmp_sbuf=data;
+     size_t tmp_sbuf_datalen=datalen;
+
+     assert(card != NULL && data != NULL && out != NULL);
+
+     
+     ctx = card->ctx;
+	LOG_FUNC_CALLED(ctx);
+                   
+     
+     if (tmp_sbuf_datalen >= 256) {
+          //printf("HHHH\n");
+          r=card->ops->decipher(card, data , datalen, out, outlen);
+          return r;
+     }
+		
+
+
+     
+	//printf("CHECK ME exit\n");
+	 //exit(1);
+     //r=card->ops->compute_signature(card, tmp_sbuf, tmp_sbuf_datalen, out, outlen);
+     r = iso_ops->compute_signature(card, tmp_sbuf, tmp_sbuf_datalen, out, outlen);
+     //r = iso_ops->decipher(card,tmp_sbuf, tmp_sbuf_datalen, out, outlen);
+	 //exit(1);
+     return r;
+     }
 
 static int jcop_decipher(struct sc_card *card,
 			 const u8 * crgram, size_t crgram_len,
@@ -800,7 +1009,7 @@ static int jcop_decipher(struct sc_card *card,
         struct sc_apdu apdu;
         u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
         u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
-	struct jcop_private_data *drvdata=DRVDATA(card);
+	jcop_private_data_t *drvdata=DRVDATA(card);
 
         assert(card != NULL && crgram != NULL && out != NULL);
         SC_FUNC_CALLED(card->ctx, 2);
@@ -852,7 +1061,7 @@ static int jcop_generate_key(struct sc_card *card, struct sc_cardctl_jcop_genkey
      u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
      u8 *p;
      int is_f4;
-     struct jcop_private_data *drvdata=DRVDATA(card);
+     jcop_private_data_t *drvdata=DRVDATA(card);
 
      if (drvdata->selected == SELECT_MF || drvdata->selected == SELECT_EFDIR )
 	  return sc_check_sw(card, 0x6A, 0x82);
@@ -975,8 +1184,8 @@ static struct sc_card_driver * sc_get_driver(void)
      jcop_ops.create_file = jcop_create_file;
      jcop_ops.delete_file = jcop_delete_file;
      jcop_ops.list_files = jcop_list_files;
-     jcop_ops.set_security_env = jcop_set_security_env;
-     jcop_ops.compute_signature = jcop_compute_signature;
+     jcop_ops.set_security_env = jcop4_set_security_env;
+     jcop_ops.compute_signature = jcop4_compute_signature;
      jcop_ops.decipher = jcop_decipher;
      jcop_ops.logout = jcop_logout;
      jcop_ops.process_fci = jcop_process_fci;
