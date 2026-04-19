@@ -186,8 +186,8 @@ static int jcop_init(struct sc_card *card)
      /* card supports host-side padding, but not raw rsa */
      flags = SC_ALGORITHM_RSA_PAD_PKCS1;
      flags |= SC_ALGORITHM_RSA_HASH_NONE;
-     flags |= SC_ALGORITHM_RSA_HASH_SHA1;
-     flags |= SC_ALGORITHM_RSA_HASH_MD5;
+     //flags |= SC_ALGORITHM_RSA_HASH_SHA1;
+     //flags |= SC_ALGORITHM_RSA_HASH_MD5;
      /* only supports keygen with 3 and F-4  exponents */
      flags |= SC_ALGORITHM_ONBOARD_KEY_GEN;
      _sc_card_add_rsa_alg(card, 512, flags, 0);
