@@ -8432,7 +8432,12 @@ static int sign_verify_openssl(CK_SESSION_HANDLE session,
 		printf("ERR: verification failed\n");
 		errors++;
 	} else if (err != 1) {
+		// Getting errors here, can mean that EVP_sha1() is only a LEGACY feature
+		// ERR_print_errors_fp( stderr );
+		// "routines:evp_pkey_ctx_set_md:invalid digest:crypto/evp/pmeth_lib"
+		// use update-crypto-policies --set LEGACY
 		printf("openssl error during verification: 0x%0x (%d)\n", err, err);
+		
 	} else
 		printf("OK\n");
 
