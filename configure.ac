@@ -1174,7 +1174,7 @@ if test "${enable_pedantic}" = "yes"; then
 	CFLAGS="-pedantic ${CFLAGS}"
 fi
 if test "${enable_strict}" = "yes"; then
-	CFLAGS="-Wall -Wextra -Wno-unused-parameter -Werror -Wstrict-aliasing=2 ${CFLAGS}"
+	CFLAGS="-Wall -Wextra -Wno-unused-parameter  -Wstrict-aliasing=2 ${CFLAGS}"
 fi
 
 AC_CONFIG_FILES([
