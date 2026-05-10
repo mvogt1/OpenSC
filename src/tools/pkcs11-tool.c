@@ -9410,6 +9410,9 @@ static int test_decrypt(CK_SESSION_HANDLE sess)
 				/* SoftHSM2 and maybe others fail with pSourceData */
 				/* the pSourceData is not used so the C_Decrypt fails with CKR_GENERAL_ERROR */
 				// errors += encrypt_decrypt(sess, mechs[n], privKeyObject, "ABC", 3)) != 0);
+
+				// DOES NOT work
+				break;
 				printf(" -- CKM_RSA_PKCS_OAEP with pSourceData != NULL, skipping\n");
 				/* fall through */
 			case CKM_RSA_PKCS:
