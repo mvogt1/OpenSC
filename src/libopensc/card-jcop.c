@@ -101,7 +101,7 @@ static const struct sc_atr_table jcop_atrs[] = {
 static int jcop_match_card(struct sc_card *card)
 {
     int i;
-     printf("MATCHI\n");
+     printf("MATCH I\n");
 	i = _sc_match_atr(card, jcop_atrs, &card->type);
 	if (i < 0)
 	     return 0;
@@ -121,7 +121,7 @@ static int jcop_init(struct sc_card *card)
 {
      jcop_private_data_t *drvdata;
      struct sc_file *f;
-     int flags;
+     unsigned long flags;
      
      drvdata=malloc(sizeof(jcop_private_data_t));
      if (!drvdata)
@@ -184,7 +184,8 @@ static int jcop_init(struct sc_card *card)
      card->cla = 0x00;
 
      /* card supports host-side padding, but not raw rsa */
-     flags = SC_ALGORITHM_RSA_PAD_PKCS1;
+     //flags = SC_ALGORITHM_RSA_PAD_PKCS1;
+     flags = SC_ALGORITHM_RSA_PAD_NONE;
      flags |= SC_ALGORITHM_RSA_HASH_NONE;
      //flags |= SC_ALGORITHM_RSA_HASH_SHA1;
      //flags |= SC_ALGORITHM_RSA_HASH_MD5;
@@ -196,7 +197,13 @@ static int jcop_init(struct sc_card *card)
      _sc_card_add_rsa_alg(card, 2048, flags, 0);
      /* State that we have an RNG */
      card->caps |= SC_CARD_CAP_RNG;
+     // Javacard support extended APDU
+     card->caps |= SC_CARD_CAP_APDU_EXT;
 
+     //card->max_send_size = 255;
+	//card->max_recv_size = 256;
+
+     //exit(0);
      return 0;
 }
 
@@ -744,7 +751,7 @@ static int jcop_set_security_env(struct sc_card *card,
 */
 
 static int jcop4_set_security_env(sc_card_t *card,
-                                    const sc_security_env_t *env,
+                                    const sc_security_env_t *env_in,
                                     int se_num)
 {
 	struct sc_card_driver *iso_drv = sc_get_iso7816_driver();
@@ -755,6 +762,10 @@ static int jcop4_set_security_env(sc_card_t *card,
 	u8 *p;
 	int r;
 	struct sc_context *ctx = card->ctx;
+     // make copy of env, becaue we change it for SC_SEC_ENV_ALG_REF_PRESENT
+     struct sc_security_env env_tmp=*env_in;
+     struct sc_security_env* env=&env_tmp;
+
 	jcop_private_data_t *drvdata = DRVDATA(card);
 
 	assert(card != NULL && env != NULL);
@@ -772,15 +783,48 @@ static int jcop4_set_security_env(sc_card_t *card,
           drvdata->key_ref=env->key_ref[0] & 0xFF;
 		//printf("Storing key id:%d 0x%x\n",drvdata->key_ref,drvdata->key_ref);
 	}
-     //printf("ENC FLASG 0x%x ALGOS: %x JCOP ALGO FLAGS:%d\n",env->flags,env->algorithm, env->algorithm_flags);
+
+     if (env->flags & SC_SEC_ENV_ALG_PRESENT) {
+          if (env->algorithm != SC_ALGORITHM_RSA) {
+               sc_log(card->ctx, "ERROR: Only RSA algorithm supported.\n");
+               return SC_ERROR_NOT_SUPPORTED;
+          }
+          env->flags |= SC_SEC_ENV_ALG_REF_PRESENT;
+          env->algorithm_ref=0x0;
+          if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1)
+               env->algorithm_ref |= 0x10;
+          if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_MD5)
+               env->algorithm_ref |= 0x20;
+     }
+     if (env->flags & SC_SEC_ENV_FILE_REF_PRESENT) {
+          // remove it
+          
+          env->flags ^= SC_SEC_ENV_FILE_REF_PRESENT;
+     }
+
+     
+     
+     
      drvdata->algorithm=env->algorithm;
      drvdata->algorithm_flags = env->algorithm_flags;
+
+     if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1) {
+          printf("SC_ALGORITHM_RSA_HASH_SHA1\n");
+          //tmp.algorithm_ref |= 0x10;
+     }
+          
+     if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_MD5) {
+          printf("SC_ALGORITHM_RSA_HASH_MD5");
+          //tmp.algorithm_ref |= 0x20;
+     }
+
+
      if (env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS) {
           printf("SC_ALGORITHM_RSA_PAD_PSS \n");
      }
 
      if (env->flags & SC_SEC_ENV_ALG_REF_PRESENT)	{
-          printf("SC_SEC_ENV_ALG_REF_PRESENT: %ld 0x%lx\n",env->algorithm_ref & 0xFF,env->algorithm_ref & 0xFF);
+          //printf("SC_SEC_ENV_ALG_REF_PRESENT: %ld 0x%lx\n",env->algorithm_ref & 0xFF,env->algorithm_ref & 0xFF);
           /*
 		*p++ = 0x80;	// algorithm reference 
 		*p++ = 0x01;
@@ -1000,7 +1044,8 @@ static int jcop4_compute_signature(sc_card_t *card,
 	 //exit(1);
      return r;
      }
-
+// OLD jcop 2(?) version replaced with jcop4 below
+/*
 static int jcop_decipher(struct sc_card *card,
 			 const u8 * crgram, size_t crgram_len,
 			 u8 * out, size_t outlen) {
@@ -1018,12 +1063,12 @@ static int jcop_decipher(struct sc_card *card,
 	if (drvdata->invalid_senv)
 	     return sc_check_sw(card, 0x69, 0x88);
 
-        /* INS: 0x2A  PERFORM SECURITY OPERATION
-         * P1:  0x80  Resp: Plain value
-         * P2:  0x86  Cmd: Padding indicator byte followed by cryptogram */
+        // INS: 0x2A  PERFORM SECURITY OPERATION
+        // P1:  0x80  Resp: Plain value
+        // P2:  0x86  Cmd: Padding indicator byte followed by cryptogram 
         sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0x2A, 0x80, 0x86);
         apdu.resp = rbuf;
-        apdu.resplen = sizeof(rbuf); /* FIXME */
+        apdu.resplen = sizeof(rbuf); // FIXME 
         apdu.le = crgram_len;
         //apdu.sensitive = 1;
         
@@ -1033,7 +1078,7 @@ static int jcop_decipher(struct sc_card *card,
 	     apdu.lc = crgram_len - 1;
 	     apdu.datalen = crgram_len -1;
 	} else {
-	     sbuf[0] = 0; /* padding indicator byte, 0x00 = No further indication */
+	     sbuf[0] = 0; // padding indicator byte, 0x00 = No further indication 
 	     memcpy(sbuf + 1, crgram, crgram_len);
 	     apdu.lc = crgram_len + 1;
 	     apdu.datalen = crgram_len + 1;
@@ -1049,6 +1094,43 @@ static int jcop_decipher(struct sc_card *card,
                 SC_FUNC_RETURN(card->ctx, 2, len);
         }
         SC_FUNC_RETURN(card->ctx, 2, sc_check_sw(card, apdu.sw1, apdu.sw2));
+}
+*/
+
+
+/*
+  Card does not use a padding indicator byte, so we cannotdelegate to iso7816_decipher()
+*/
+static int jcop4_decipher(struct sc_card *card,
+			 const u8 * crgram, size_t crgram_len,
+			 u8 * out, size_t outlen) {
+
+
+	sc_apdu_t apdu;
+	u8 resp[256];
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_4, 0x2A, 0x80, 0x86);
+	apdu.data = crgram;
+	apdu.datalen = crgram_len;
+	apdu.lc = crgram_len;
+
+	apdu.resp = resp;
+	apdu.resplen = sizeof(resp);
+	apdu.le = sizeof(resp);
+
+	
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "PSO DECIPHER failed");
+
+	if (apdu.resplen > outlen)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_BUFFER_TOO_SMALL);
+	memcpy(out, resp, apdu.resplen);
+	LOG_FUNC_RETURN(card->ctx, (int)apdu.resplen);
 }
 
 /*
@@ -1186,7 +1268,7 @@ static struct sc_card_driver * sc_get_driver(void)
      jcop_ops.list_files = jcop_list_files;
      jcop_ops.set_security_env = jcop4_set_security_env;
      jcop_ops.compute_signature = jcop4_compute_signature;
-     jcop_ops.decipher = jcop_decipher;
+     jcop_ops.decipher = jcop4_decipher;
      jcop_ops.logout = jcop_logout;
      jcop_ops.process_fci = jcop_process_fci;
      jcop_ops.card_ctl = jcop_card_ctl;
