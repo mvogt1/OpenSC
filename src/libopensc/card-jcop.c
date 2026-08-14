@@ -91,8 +91,8 @@ static const char *jcop_atrs[] = {
 */
 
 static const struct sc_atr_table jcop_atrs[] = {
-       { "3B:E6:00:FF:81:31:FE:45:4A:43:4F:50:33:31:06", NULL, NULL, SC_CARD_TYPE_BLUEZ_APPLET_V2_STD, 0, NULL },
-       { "3B:F9:96:00:00:80:31:FE:45:53:43:45:37:20:00:00:20:20:27", NULL, NULL, SC_CARD_TYPE_BLUEZ_APPLET_V4_7,0, NULL },
+       { "3B:E6:00:FF:81:31:FE:45:4A:43:4F:50:33:31:06", NULL, NULL, SC_CARD_TYPE_JCOP_GENERIC, 0, NULL },
+       { "3B:F9:96:00:00:80:31:FE:45:53:43:45:37:20:00:00:20:20:27", NULL, NULL, SC_CARD_TYPE_JCOP_V4_7, 0, NULL },
        { NULL, NULL, NULL, 0, 0, NULL }
 };
 
@@ -101,11 +101,11 @@ static const struct sc_atr_table jcop_atrs[] = {
 static int jcop_match_card(struct sc_card *card)
 {
     int i;
-    printf("JCOP \n");
+    printf("JCOP4 \n");
     i = _sc_match_atr(card, jcop_atrs, &card->type);
     if (i < 0)
        return 0;
-    printf("JCOP OK\n");
+    printf("JCOP4 OK\n");
     return 1; 
 }
 
