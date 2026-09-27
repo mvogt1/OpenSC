@@ -1844,6 +1844,15 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 			goto out;
 		}
 
+		/* When polling, the states were just read by the first
+		 * SCardGetStatusChange() and are stored in dwCurrentState. A second
+		 * call without timeout would only catch changes since then, which
+		 * the next poll reports as well. */
+		if (timeout == 0) {
+			r = SC_ERROR_EVENT_TIMEOUT;
+			goto out;
+		}
+
 		/* Set the timeout if caller wants to time out */
 		if (timeout == -1) {
 			dwtimeout = INFINITE;
