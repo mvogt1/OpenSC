@@ -89,6 +89,13 @@ app default {
 		# Default: leave
 		# reconnect_action = reset;
 		#
+		# Time in milliseconds in which a repeated card presence check or
+		# event poll is answered from the last result instead of asking
+		# PC/SC again. Reduces PC/SC traffic of applications that poll the
+		# slots often, but card removal is noticed up to this time later.
+		# Default: 0 (always ask PC/SC)
+		# presence_check_interval = 500;
+		#
 		# Enable pinpad if detected (PC/SC v2.0.2 Part 10)
 		# Default: true
 		# enable_pinpad = false;
