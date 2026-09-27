@@ -712,7 +712,8 @@ static int pcsc_disconnect(sc_reader_t * reader)
 	return SC_SUCCESS;
 }
 
-static int pcsc_begin_transaction(sc_reader_t *reader)
+static int
+pcsc_begin_transaction(sc_reader_t *reader)
 {
 	LONG rv;
 	int r;
@@ -754,7 +755,8 @@ static int pcsc_begin_transaction(sc_reader_t *reader)
 	}
 }
 
-static int pcsc_lock(sc_reader_t *reader)
+static int
+pcsc_lock(sc_reader_t *reader)
 {
 #if PCSC_DEFERRED_LOCK
 	struct pcsc_private_data *priv = reader->drv_data;
@@ -775,7 +777,8 @@ static int pcsc_lock(sc_reader_t *reader)
  * returned without sending the command: the caller may have decided on
  * cached card state (e.g. the selected file) that is no longer valid.
  * lock_pending stays set, so the next command tries again. */
-static int pcsc_ensure_locked(sc_reader_t *reader)
+static int
+pcsc_ensure_locked(sc_reader_t *reader)
 {
 	struct pcsc_private_data *priv = reader->drv_data;
 
