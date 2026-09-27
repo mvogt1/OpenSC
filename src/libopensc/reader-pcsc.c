@@ -383,6 +383,29 @@ static int refresh_attributes(sc_reader_t *reader)
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
 
+	/* With a connected card, SCardStatus() on the handle is sufficient: it
+	 * fails if the card was removed or reset or the reader is gone. Only
+	 * then the full check with SCardGetStatusChange() below is done.
+	 * SC_READER_CARD_INUSE and SC_READER_CARD_EXCLUSIVE are not updated. */
+	if (priv->pcsc_card != 0 && priv->reader_state.szReader != NULL &&
+			(reader->flags & SC_READER_CARD_PRESENT) && !(reader->flags & SC_READER_REMOVED)) {
+		DWORD readers_len = 0, cstate = 0, prot, atr_len = SC_MAX_ATR_SIZE;
+		unsigned char atr[SC_MAX_ATR_SIZE];
+
+		rv = PCSC_CALL(&priv->gpriv->api, SCardStatus, priv->pcsc_card, NULL,
+				&readers_len, &cstate, &prot, atr, &atr_len);
+		if (rv == SCARD_S_SUCCESS && atr_len <= SC_MAX_ATR_SIZE) {
+			reader->flags &= ~SC_READER_CARD_CHANGED;
+			if (atr_len != reader->atr.len || memcmp(atr, reader->atr.value, atr_len) != 0) {
+				reader->atr.len = atr_len;
+				memcpy(reader->atr.value, atr, atr_len);
+			}
+			sc_log(reader->ctx, "card present (SCardStatus)");
+			return SC_SUCCESS;
+		}
+		PCSC_TRACE(reader, "SCardStatus failed, full check", rv);
+	}
+
 	if (priv->reader_state.szReader == NULL || reader->flags & SC_READER_REMOVED) {
 		priv->reader_state.szReader = reader->name;
 		priv->reader_state.dwCurrentState = SCARD_STATE_UNAWARE;
