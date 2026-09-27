@@ -26,7 +26,7 @@
  * when the PC/SC reader driver is released: as one JSON line appended to the
  * file named by the environment variable OPENSC_PCSC_STATS, or to the debug
  * log if the variable is not set. With 0 the wrappers only forward the call. */
-#define PCSC_API_STATS 0
+#define PCSC_API_STATS 1
 
 #include <stdlib.h>
 #include <string.h>
