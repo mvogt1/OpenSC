@@ -130,6 +130,9 @@ struct pcsc_global_private_data {
 	DWORD disconnect_action;
 	DWORD transaction_end_action;
 	DWORD reconnect_action;
+	/* ms in which a repeated card presence check or event poll is answered
+	 * from the last result, 0 = always ask PC/SC */
+	unsigned int presence_check_interval;
 	const char *provider_library;
 	struct pcsc_api api;
 
@@ -158,12 +161,36 @@ struct pcsc_private_data {
 	int locked;
 	/* sc_lock() was called, the transaction is started by the next command */
 	int lock_pending;
+	/* time of the last successful card presence check in ms, 0 = none */
+	unsigned long long last_presence_check;
 };
 
 static int pcsc_detect_card_presence(sc_reader_t *reader);
 static int pcsc_ensure_locked(sc_reader_t *reader);
 static int pcsc_reconnect(sc_reader_t * reader, DWORD action);
 static int pcsc_connect(sc_reader_t *reader);
+
+/* Monotonic time in ms, used to rate-limit presence checks */
+static unsigned long long
+pcsc_now_ms(void)
+{
+#ifdef _WIN32
+	return (unsigned long long)GetTickCount64();
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000 + (unsigned long long)ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Returns 1 if the last check at `last` is recent enough to be reused */
+static int
+pcsc_check_is_recent(struct pcsc_global_private_data *gpriv, unsigned long long last)
+{
+	return gpriv->presence_check_interval != 0 && last != 0 &&
+	       pcsc_now_ms() - last < gpriv->presence_check_interval;
+}
 
 static DWORD pcsc_reset_action(const char *str)
 {
@@ -288,6 +315,7 @@ static int pcsc_internal_transmit(sc_reader_t *reader,
 
 	if (rv != SCARD_S_SUCCESS) {
 		PCSC_TRACE(reader, "SCardTransmit/Control failed", rv);
+		priv->last_presence_check = 0;
 		switch (rv) {
 		case SCARD_W_REMOVED_CARD:
 			return SC_ERROR_CARD_REMOVED;
@@ -371,7 +399,8 @@ out:
 
 /* Calls SCardGetStatusChange on the reader to set ATR and associated flags
  * (card present/changed) */
-static int refresh_attributes(sc_reader_t *reader)
+static int
+refresh_attributes_from_pcsc(sc_reader_t *reader)
 {
 	struct pcsc_private_data *priv = reader->drv_data;
 	unsigned long old_flags = reader->flags;
@@ -528,12 +557,35 @@ static int refresh_attributes(sc_reader_t *reader)
 	return SC_SUCCESS;
 }
 
+/* Updates ATR and card flags. With allow_recent, the result of the last
+ * check is reused if it is younger than presence_check_interval. A check
+ * without allow_recent invalidates it, as the card state may change. */
+static int
+refresh_attributes(sc_reader_t *reader, int allow_recent)
+{
+	struct pcsc_private_data *priv = reader->drv_data;
+	int r;
+
+	if (allow_recent && pcsc_check_is_recent(priv->gpriv, priv->last_presence_check)) {
+		/* a change was already reported by the last check */
+		reader->flags &= ~SC_READER_CARD_CHANGED;
+		sc_log(reader->ctx, "presence checked recently, reusing result");
+		return SC_SUCCESS;
+	}
+
+	priv->last_presence_check = 0;
+	r = refresh_attributes_from_pcsc(reader);
+	if (r == SC_SUCCESS && allow_recent)
+		priv->last_presence_check = pcsc_now_ms();
+	return r;
+}
+
 static int pcsc_detect_card_presence(sc_reader_t *reader)
 {
 	int rv;
 	LOG_FUNC_CALLED(reader->ctx);
 
-	rv = refresh_attributes(reader);
+	rv = refresh_attributes(reader, 1);
 	if (rv != SC_SUCCESS)
 		LOG_FUNC_RETURN(reader->ctx, rv);
 
@@ -600,7 +652,7 @@ static int pcsc_reconnect(sc_reader_t * reader, DWORD action)
 
 	sc_log(reader->ctx, "Reconnecting to the card...");
 
-	r = refresh_attributes(reader);
+	r = refresh_attributes(reader, 0);
 	if (r!= SC_SUCCESS)
 		return r;
 
@@ -671,7 +723,7 @@ static int pcsc_connect(sc_reader_t *reader)
 
 	LOG_FUNC_CALLED(reader->ctx);
 
-	r = refresh_attributes(reader);
+	r = refresh_attributes(reader, 0);
 	if (r != SC_SUCCESS)
 		LOG_FUNC_RETURN(reader->ctx, r);
 
@@ -723,6 +775,7 @@ static int pcsc_disconnect(sc_reader_t * reader)
 {
 	struct pcsc_private_data *priv = reader->drv_data;
 
+	priv->last_presence_check = 0;
 	if (!priv->gpriv->cardmod && !(reader->ctx->flags & SC_CTX_FLAG_TERMINATE)) {
 		LONG rv = PCSC_CALL(&priv->gpriv->api, SCardDisconnect, priv->pcsc_card, priv->gpriv->disconnect_action);
 		PCSC_TRACE(reader, "SCardDisconnect returned", rv);
@@ -910,6 +963,7 @@ static int pcsc_init(sc_context_t *ctx)
 	struct pcsc_global_private_data *gpriv;
 	scconf_block *conf_block = NULL;
 	int ret = SC_ERROR_INTERNAL;
+	int interval;
 	size_t i;
 
 	gpriv = calloc(1, sizeof(struct pcsc_global_private_data));
@@ -939,6 +993,7 @@ static int pcsc_init(sc_context_t *ctx)
 	 *			   the values by default and values declared by reader */
 	gpriv->force_max_send_size = 0;
 	gpriv->force_max_recv_size = 0;
+	gpriv->presence_check_interval = 0;
 
 	conf_block = sc_get_conf_block(ctx, "reader_driver", "pcsc", 1);
 	if (conf_block) {
@@ -962,6 +1017,8 @@ static int pcsc_init(sc_context_t *ctx)
 				"max_send_size", (int)gpriv->force_max_send_size);
 		gpriv->force_max_recv_size = scconf_get_int(conf_block,
 				"max_recv_size", (int)gpriv->force_max_recv_size);
+		interval = scconf_get_int(conf_block, "presence_check_interval", 0);
+		gpriv->presence_check_interval = interval > 0 ? (unsigned int)interval : 0;
 	}
 
 	if (gpriv->cardmod) {
@@ -975,12 +1032,12 @@ static int pcsc_init(sc_context_t *ctx)
 	}
 	sc_log(ctx,
 			"PC/SC options: connect_exclusive=%d disconnect_action=%u transaction_end_action=%u"
-			" reconnect_action=%u enable_pinpad=%d enable_pace=%d",
+			" reconnect_action=%u enable_pinpad=%d enable_pace=%d presence_check_interval=%u",
 			gpriv->connect_exclusive,
 			(unsigned int)gpriv->disconnect_action,
 			(unsigned int)gpriv->transaction_end_action,
 			(unsigned int)gpriv->reconnect_action, gpriv->enable_pinpad,
-			gpriv->enable_pace);
+			gpriv->enable_pace, gpriv->presence_check_interval);
 
 	ret = pcsc_api_load(ctx, &gpriv->api, gpriv->provider_library);
 	if (ret != SC_SUCCESS)
@@ -1398,7 +1455,7 @@ int pcsc_add_reader(sc_context_t *ctx,
 	ret = _sc_add_reader(ctx, reader);
 
 	if (ret == SC_SUCCESS) {
-		refresh_attributes(reader);
+		refresh_attributes(reader, 0);
 	}
 
 err1:
@@ -1528,7 +1585,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 				if (reader->flags & SC_READER_REMOVED) {
 					reader->flags &= ~SC_READER_REMOVED;
 					gpriv->attached_reader = reader;
-					refresh_attributes(reader);
+					refresh_attributes(reader, 0);
 				}
 				break;
 			}
@@ -1606,6 +1663,8 @@ out:
 struct pcsc_reader_states {
 	size_t pcsc_wait_ctx_index;
 	SCARD_READERSTATE *reader_states;
+	/* time of the last poll (timeout 0) in ms, 0 = none */
+	unsigned long long last_poll;
 };
 
 static void
@@ -1767,14 +1826,22 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 		goto out;
 	}
 
+	if (timeout == 0 && pcsc_check_is_recent(gpriv, states->last_poll)) {
+		sc_log(ctx, "polled recently, reporting no event");
+		r = SC_ERROR_EVENT_TIMEOUT;
+		goto out;
+	}
+
 	rv = PCSC_CALL(&gpriv->api, SCardGetStatusChange, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], 0, states->reader_states, num_watch);
 	if (rv != SCARD_S_SUCCESS) {
 		if (rv != (LONG)SCARD_E_TIMEOUT) {
 			PCSC_LOG(ctx, "SCardGetStatusChange(1) failed", rv);
+			states->last_poll = 0;
 			r = pcsc_to_opensc_error(rv);
 			goto out;
 		}
 	}
+	states->last_poll = timeout == 0 ? pcsc_now_ms() : 0;
 
 	/* Wait for a status change
 	 */
