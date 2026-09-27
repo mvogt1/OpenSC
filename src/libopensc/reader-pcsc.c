@@ -78,6 +78,11 @@
 #define SCARD_ATTR_VENDOR_IFD_VERSION SCARD_ATTR_VALUE(SCARD_CLASS_VENDOR_INFO, 0x0102) /**< Vendor-supplied interface device version (DWORD in the form 0xMMmmbbbb where MM = major version, mm = minor version, and bbbb = build number). */
 #endif
 
+/* Start the PC/SC transaction (SCardBeginTransaction) only when the first
+ * command is sent to the card, not already in sc_lock(). Locked sections
+ * that are served from caches then cause no PC/SC calls at all. */
+#define PCSC_DEFERRED_LOCK 1
+
 /* Logging */
 #define PCSC_TRACE(reader, desc, rv) do { sc_log(reader->ctx, "%s:" desc ": 0x%08lx\n", reader->name, (unsigned long)((ULONG)rv)); } while (0)
 #define PCSC_LOG(ctx, desc, rv) do { sc_log(ctx, desc ": 0x%08lx\n", (unsigned long)((ULONG)rv)); } while (0)
@@ -151,9 +156,12 @@ struct pcsc_private_data {
 	DWORD get_tlv_properties;
 
 	int locked;
+	/* sc_lock() was called, the transaction is started by the next command */
+	int lock_pending;
 };
 
 static int pcsc_detect_card_presence(sc_reader_t *reader);
+static int pcsc_ensure_locked(sc_reader_t *reader);
 static int pcsc_reconnect(sc_reader_t * reader, DWORD action);
 static int pcsc_connect(sc_reader_t *reader);
 
@@ -252,6 +260,10 @@ static int pcsc_internal_transmit(sc_reader_t *reader,
 		return SC_ERROR_INVALID_ARGUMENTS;
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
+
+	r = pcsc_ensure_locked(reader);
+	if (r != SC_SUCCESS)
+		return r;
 
 	sSendPci.dwProtocol = opensc_proto_to_pcsc(reader->active_protocol);
 	sSendPci.cbPciLength = sizeof(sSendPci);
@@ -700,7 +712,7 @@ static int pcsc_disconnect(sc_reader_t * reader)
 	return SC_SUCCESS;
 }
 
-static int pcsc_lock(sc_reader_t *reader)
+static int pcsc_begin_transaction(sc_reader_t *reader)
 {
 	LONG rv;
 	int r;
@@ -742,6 +754,36 @@ static int pcsc_lock(sc_reader_t *reader)
 	}
 }
 
+static int pcsc_lock(sc_reader_t *reader)
+{
+#if PCSC_DEFERRED_LOCK
+	struct pcsc_private_data *priv = reader->drv_data;
+
+	if (priv->gpriv->cardmod)
+		return SC_SUCCESS;
+	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
+		return SC_ERROR_NOT_ALLOWED;
+	priv->lock_pending = 1;
+	return SC_SUCCESS;
+#else
+	return pcsc_begin_transaction(reader);
+#endif
+}
+
+/* Starts a deferred transaction before a command is sent to the card.
+ * If the card was reset or the reader reattached meanwhile, the error is
+ * returned without sending the command: the caller may have decided on
+ * cached card state (e.g. the selected file) that is no longer valid.
+ * lock_pending stays set, so the next command tries again. */
+static int pcsc_ensure_locked(sc_reader_t *reader)
+{
+	struct pcsc_private_data *priv = reader->drv_data;
+
+	if (!priv->lock_pending || priv->locked || priv->gpriv->cardmod)
+		return SC_SUCCESS;
+	return pcsc_begin_transaction(reader);
+}
+
 static int pcsc_unlock(sc_reader_t *reader)
 {
 	LONG rv;
@@ -754,6 +796,12 @@ static int pcsc_unlock(sc_reader_t *reader)
 
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
+
+	priv->lock_pending = 0;
+#if PCSC_DEFERRED_LOCK
+	if (!priv->locked)
+		return SC_SUCCESS;
+#endif
 
 	rv = PCSC_CALL(&priv->gpriv->api, SCardEndTransaction, priv->pcsc_card, priv->gpriv->transaction_end_action);
 
