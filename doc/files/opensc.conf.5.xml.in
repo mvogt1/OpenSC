@@ -644,6 +644,21 @@ app <replaceable>application</replaceable> {
 					</varlistentry>
 					<varlistentry>
 						<term>
+							<option>presence_check_interval = <replaceable>num</replaceable>;</option>
+						</term>
+						<listitem><para>
+								Time in milliseconds in which a
+								repeated card presence check or
+								event poll is answered from the
+								last result instead of asking PC/SC
+								again. Card removal is noticed up
+								to this time later (Default:
+								<literal>0</literal>, always ask
+								PC/SC).
+						</para></listitem>
+					</varlistentry>
+					<varlistentry>
+						<term>
 							<option>enable_pinpad = <replaceable>bool</replaceable>;</option>
 						</term>
 						<listitem><para>
