@@ -36,10 +36,10 @@
 #include <arpa/inet.h>
 #endif
 
-#include "common/libscdl.h"
-#include "internal.h"
-#include "internal-winscard.h"
 #include "card-sc-hsm.h"
+#include "internal-winscard.h"
+#include "internal.h"
+#include "pcsc-api.h"
 
 #include "pace.h"
 
@@ -126,22 +126,7 @@ struct pcsc_global_private_data {
 	DWORD transaction_end_action;
 	DWORD reconnect_action;
 	const char *provider_library;
-	void *dlhandle;
-	SCardEstablishContext_t SCardEstablishContext;
-	SCardReleaseContext_t SCardReleaseContext;
-	SCardConnect_t SCardConnect;
-	SCardReconnect_t SCardReconnect;
-	SCardDisconnect_t SCardDisconnect;
-	SCardBeginTransaction_t SCardBeginTransaction;
-	SCardEndTransaction_t SCardEndTransaction;
-	SCardStatus_t SCardStatus;
-	SCardGetStatusChange_t SCardGetStatusChange;
-	SCardCancel_t SCardCancel;
-	SCardControlOLD_t SCardControlOLD;
-	SCardControl_t SCardControl;
-	SCardTransmit_t SCardTransmit;
-	SCardListReaders_t SCardListReaders;
-	SCardGetAttrib_t SCardGetAttrib;
+	struct pcsc_api api;
 
 	sc_reader_t *attached_reader;
 	sc_reader_t *removed_reader;
@@ -277,14 +262,14 @@ static int pcsc_internal_transmit(sc_reader_t *reader,
 	dwRecvLength = (DWORD)*recvsize;
 
 	if (!control) {
-		rv = priv->gpriv->SCardTransmit(card, &sSendPci, sendbuf, dwSendLength,
-				   &sRecvPci, recvbuf, &dwRecvLength);
+		rv = PCSC_CALL(&priv->gpriv->api, SCardTransmit, card, &sSendPci, sendbuf, dwSendLength,
+				&sRecvPci, recvbuf, &dwRecvLength);
 	} else {
-		if (priv->gpriv->SCardControlOLD) {
-			rv = priv->gpriv->SCardControlOLD(card, sendbuf, dwSendLength,
-				  recvbuf, &dwRecvLength);
-		} else if (priv->gpriv->SCardControl) {
-			rv = priv->gpriv->SCardControl(card, (DWORD)control, sendbuf, dwSendLength,
+		if (priv->gpriv->api.SCardControlOLD) {
+			rv = PCSC_CALL(&priv->gpriv->api, SCardControlOLD, card, sendbuf, dwSendLength,
+					recvbuf, &dwRecvLength);
+		} else if (priv->gpriv->api.SCardControl) {
+			rv = PCSC_CALL(&priv->gpriv->api, SCardControl, card, (DWORD)control, sendbuf, dwSendLength,
 					recvbuf, dwRecvLength, &dwRecvLength);
 		}
 	}
@@ -394,7 +379,7 @@ static int refresh_attributes(sc_reader_t *reader)
 		priv->reader_state.dwCurrentState = priv->reader_state.dwEventState;
 	}
 
-	rv = priv->gpriv->SCardGetStatusChange(priv->gpriv->pcsc_ctx, 0, &priv->reader_state, 1);
+	rv = PCSC_CALL(&priv->gpriv->api, SCardGetStatusChange, priv->gpriv->pcsc_ctx, 0, &priv->reader_state, 1);
 
 	if (rv != SCARD_S_SUCCESS) {
 		if (rv == (LONG)SCARD_E_TIMEOUT) {
@@ -413,7 +398,7 @@ static int refresh_attributes(sc_reader_t *reader)
 				DWORD readers_len = 0, cstate = 0, prot, atr_len = SC_MAX_ATR_SIZE;
 				/* When reader is removed between two subsequent calls to refresh_attributes,
 				 * SCardGetStatusChange does not notice the change, test the card handle with SCardStatus */
-				rv = priv->gpriv->SCardStatus(priv->pcsc_card, NULL, &readers_len, &cstate, &prot, atr, &atr_len);
+				rv = PCSC_CALL(&priv->gpriv->api, SCardStatus, priv->pcsc_card, NULL, &readers_len, &cstate, &prot, atr, &atr_len);
 				if (rv != (LONG)SCARD_S_SUCCESS)
 					reader->flags |= SC_READER_CARD_CHANGED;
 				/* If this happens, card must be reconnected, otherwise SCardGetStatusChange() will still return timeout
@@ -490,7 +475,7 @@ static int refresh_attributes(sc_reader_t *reader)
 				 * the handle will be invalid. */
 				DWORD readers_len = 0, cstate, prot, atr_len = SC_MAX_ATR_SIZE;
 				unsigned char atr[SC_MAX_ATR_SIZE];
-				rv = priv->gpriv->SCardStatus(priv->pcsc_card, NULL,
+				rv = PCSC_CALL(&priv->gpriv->api, SCardStatus, priv->pcsc_card, NULL,
 						&readers_len, &cstate, &prot, atr, &atr_len);
 				if (rv == (LONG)SCARD_W_REMOVED_CARD || rv == (LONG)SCARD_E_INVALID_VALUE)
 					reader->flags |= SC_READER_CARD_CHANGED;
@@ -596,10 +581,9 @@ static int pcsc_reconnect(sc_reader_t * reader, DWORD action)
 	priv->locked = 0;
 #endif
 
-	rv = priv->gpriv->SCardReconnect(priv->pcsc_card,
+	rv = PCSC_CALL(&priv->gpriv->api, SCardReconnect, priv->pcsc_card,
 			priv->gpriv->connect_exclusive ? SCARD_SHARE_EXCLUSIVE : SCARD_SHARE_SHARED,
 			protocol, action, &active_proto);
-
 
 	PCSC_TRACE(reader, "SCardReconnect returned", rv);
 	if (rv != SCARD_S_SUCCESS) {
@@ -661,7 +645,7 @@ static int pcsc_connect(sc_reader_t *reader)
 
 
 	if (!priv->gpriv->cardmod) {
-		rv = priv->gpriv->SCardConnect(priv->gpriv->pcsc_ctx, reader->name,
+		rv = PCSC_CALL(&priv->gpriv->api, SCardConnect, priv->gpriv->pcsc_ctx, reader->name,
 				priv->gpriv->connect_exclusive ? SCARD_SHARE_EXCLUSIVE : SCARD_SHARE_SHARED,
 				protocol, &card_handle, &active_proto);
 		if (rv != SCARD_S_SUCCESS) {
@@ -705,7 +689,7 @@ static int pcsc_disconnect(sc_reader_t * reader)
 	struct pcsc_private_data *priv = reader->drv_data;
 
 	if (!priv->gpriv->cardmod && !(reader->ctx->flags & SC_CTX_FLAG_TERMINATE)) {
-		LONG rv = priv->gpriv->SCardDisconnect(priv->pcsc_card, priv->gpriv->disconnect_action);
+		LONG rv = PCSC_CALL(&priv->gpriv->api, SCardDisconnect, priv->pcsc_card, priv->gpriv->disconnect_action);
 		PCSC_TRACE(reader, "SCardDisconnect returned", rv);
 		if (rv == SCARD_S_SUCCESS) {
 			// Card was successfully disconnected, reset the card handle
@@ -730,8 +714,7 @@ static int pcsc_lock(sc_reader_t *reader)
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
 
-	rv = priv->gpriv->SCardBeginTransaction(priv->pcsc_card);
-
+	rv = PCSC_CALL(&priv->gpriv->api, SCardBeginTransaction, priv->pcsc_card);
 
 	if (rv != SCARD_S_SUCCESS)
 		PCSC_TRACE(reader, "SCardBeginTransaction returned", rv);
@@ -772,7 +755,7 @@ static int pcsc_unlock(sc_reader_t *reader)
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
 
-	rv = priv->gpriv->SCardEndTransaction(priv->pcsc_card, priv->gpriv->transaction_end_action);
+	rv = PCSC_CALL(&priv->gpriv->api, SCardEndTransaction, priv->pcsc_card, priv->gpriv->transaction_end_action);
 
 	priv->locked = 0;
 	if (rv != SCARD_S_SUCCESS) {
@@ -824,10 +807,10 @@ static int pcsc_cancel(sc_context_t *ctx)
 
 	for (i = 0; i < ARRAY_SIZE(gpriv->pcsc_wait_ctx); i++) {
 		if (gpriv->pcsc_wait_ctx[i] != (SCARDCONTEXT)-1) {
-			rv = gpriv->SCardCancel(gpriv->pcsc_wait_ctx[i]);
+			rv = PCSC_CALL(&gpriv->api, SCardCancel, gpriv->pcsc_wait_ctx[i]);
 			if (rv == SCARD_S_SUCCESS) {
 				/* Also close and clear the waiting context */
-				rv = gpriv->SCardReleaseContext(gpriv->pcsc_wait_ctx[i]);
+				rv = PCSC_CALL(&gpriv->api, SCardReleaseContext, gpriv->pcsc_wait_ctx[i]);
 				gpriv->pcsc_wait_ctx[i] = -1;
 			}
 		}
@@ -925,76 +908,16 @@ static int pcsc_init(sc_context_t *ctx)
 			(unsigned int)gpriv->reconnect_action, gpriv->enable_pinpad,
 			gpriv->enable_pace);
 
-	gpriv->dlhandle = sc_dlopen(gpriv->provider_library);
-	if (gpriv->dlhandle == NULL) {
-		ret = SC_ERROR_CANNOT_LOAD_MODULE;
+	ret = pcsc_api_load(ctx, &gpriv->api, gpriv->provider_library);
+	if (ret != SC_SUCCESS)
 		goto out;
-	}
-
-	gpriv->SCardEstablishContext = (SCardEstablishContext_t)sc_dlsym(gpriv->dlhandle, "SCardEstablishContext");
-	gpriv->SCardReleaseContext = (SCardReleaseContext_t)sc_dlsym(gpriv->dlhandle, "SCardReleaseContext");
-	gpriv->SCardConnect = (SCardConnect_t)sc_dlsym(gpriv->dlhandle, "SCardConnect");
-	gpriv->SCardReconnect = (SCardReconnect_t)sc_dlsym(gpriv->dlhandle, "SCardReconnect");
-	gpriv->SCardDisconnect = (SCardDisconnect_t)sc_dlsym(gpriv->dlhandle, "SCardDisconnect");
-	gpriv->SCardBeginTransaction = (SCardBeginTransaction_t)sc_dlsym(gpriv->dlhandle, "SCardBeginTransaction");
-	gpriv->SCardEndTransaction = (SCardEndTransaction_t)sc_dlsym(gpriv->dlhandle, "SCardEndTransaction");
-	gpriv->SCardStatus = (SCardStatus_t)sc_dlsym(gpriv->dlhandle, "SCardStatus");
-	gpriv->SCardGetStatusChange = (SCardGetStatusChange_t)sc_dlsym(gpriv->dlhandle, "SCardGetStatusChange");
-	gpriv->SCardCancel = (SCardCancel_t)sc_dlsym(gpriv->dlhandle, "SCardCancel");
-	gpriv->SCardTransmit = (SCardTransmit_t)sc_dlsym(gpriv->dlhandle, "SCardTransmit");
-	gpriv->SCardListReaders = (SCardListReaders_t)sc_dlsym(gpriv->dlhandle, "SCardListReaders");
-
-	if (gpriv->SCardConnect == NULL)
-		gpriv->SCardConnect = (SCardConnect_t)sc_dlsym(gpriv->dlhandle, "SCardConnectA");
-	if (gpriv->SCardStatus == NULL)
-		gpriv->SCardStatus = (SCardStatus_t)sc_dlsym(gpriv->dlhandle, "SCardStatusA");
-	if (gpriv->SCardGetStatusChange == NULL)
-		gpriv->SCardGetStatusChange = (SCardGetStatusChange_t)sc_dlsym(gpriv->dlhandle, "SCardGetStatusChangeA");
-	if (gpriv->SCardListReaders == NULL)
-		gpriv->SCardListReaders = (SCardListReaders_t)sc_dlsym(gpriv->dlhandle, "SCardListReadersA");
-
-	/* If we have SCardGetAttrib it is correct API */
-	gpriv->SCardGetAttrib = (SCardGetAttrib_t)sc_dlsym(gpriv->dlhandle, "SCardGetAttrib");
-	if (gpriv->SCardGetAttrib != NULL) {
-#ifdef __APPLE__
-		gpriv->SCardControl = (SCardControl_t)sc_dlsym(gpriv->dlhandle, "SCardControl132");
-#endif
-		if (gpriv->SCardControl == NULL) {
-			gpriv->SCardControl = (SCardControl_t)sc_dlsym(gpriv->dlhandle, "SCardControl");
-		}
-	}
-	else {
-		gpriv->SCardControlOLD = (SCardControlOLD_t)sc_dlsym(gpriv->dlhandle, "SCardControl");
-	}
-
-	if (
-		gpriv->SCardReleaseContext == NULL ||
-		gpriv->SCardConnect == NULL ||
-		gpriv->SCardReconnect == NULL ||
-		gpriv->SCardDisconnect == NULL ||
-		gpriv->SCardBeginTransaction == NULL ||
-		gpriv->SCardEndTransaction == NULL ||
-		gpriv->SCardStatus == NULL ||
-		gpriv->SCardGetStatusChange == NULL ||
-		gpriv->SCardCancel == NULL ||
-		(gpriv->SCardControl == NULL && gpriv->SCardControlOLD == NULL) ||
-		gpriv->SCardTransmit == NULL ||
-		gpriv->SCardListReaders == NULL
-	) {
-		ret = SC_ERROR_CANNOT_LOAD_MODULE;
-		goto out;
-	}
 
 	ctx->reader_drv_data = gpriv;
 	gpriv = NULL;
 	ret = SC_SUCCESS;
 
 out:
-	if (gpriv != NULL) {
-		if (gpriv->dlhandle != NULL)
-			sc_dlclose(gpriv->dlhandle);
-		free(gpriv);
-	}
+	free(gpriv);
 
 	return ret;
 }
@@ -1009,9 +932,8 @@ static int pcsc_finish(sc_context_t *ctx)
 	if (gpriv) {
 		if (!gpriv->cardmod && gpriv->pcsc_ctx != (SCARDCONTEXT)-1 &&
 				!(ctx->flags & SC_CTX_FLAG_TERMINATE))
-			gpriv->SCardReleaseContext(gpriv->pcsc_ctx);
-		if (gpriv->dlhandle != NULL)
-			sc_dlclose(gpriv->dlhandle);
+			PCSC_CALL(&gpriv->api, SCardReleaseContext, gpriv->pcsc_ctx);
+		pcsc_api_unload(ctx, &gpriv->api);
 		free(gpriv);
 	}
 
@@ -1044,11 +966,11 @@ static unsigned long part10_detect_pace_capabilities(sc_reader_t *reader, SCARDH
 	if (!priv)
 		goto err;
 
-	if (priv->pace_ioctl && priv->gpriv && priv->gpriv->SCardControl) {
-		if (SCARD_S_SUCCESS != priv->gpriv->SCardControl(card_handle,
-					priv->pace_ioctl, pace_capabilities_buf,
-					sizeof pace_capabilities_buf, rbuf, sizeof(rbuf),
-					&rcount)) {
+	if (priv->pace_ioctl && priv->gpriv && priv->gpriv->api.SCardControl) {
+		if (SCARD_S_SUCCESS != PCSC_CALL(&priv->gpriv->api, SCardControl, card_handle,
+						       priv->pace_ioctl, pace_capabilities_buf,
+						       sizeof pace_capabilities_buf, rbuf, sizeof(rbuf),
+						       &rcount)) {
 			sc_log(reader->ctx, "PC/SC v2 part 10 amd1: Get PACE properties failed!");
 			goto err;
 		}
@@ -1103,9 +1025,9 @@ static size_t part10_detect_max_data(sc_reader_t *reader, SCARDHANDLE card_handl
 	if (!priv)
 		goto err;
 
-	if (priv->get_tlv_properties && priv->gpriv && priv->gpriv->SCardControl) {
-		if (SCARD_S_SUCCESS != priv->gpriv->SCardControl(card_handle,
-				priv->get_tlv_properties, NULL, 0, rbuf, sizeof(rbuf), &rcount)) {
+	if (priv->get_tlv_properties && priv->gpriv && priv->gpriv->api.SCardControl) {
+		if (SCARD_S_SUCCESS != PCSC_CALL(&priv->gpriv->api, SCardControl, card_handle,
+						       priv->get_tlv_properties, NULL, 0, rbuf, sizeof(rbuf), &rcount)) {
 			sc_log(reader->ctx, "PC/SC v2 part 10: Get TLV properties failed!");
 			goto err;
 		}
@@ -1136,10 +1058,10 @@ static int part10_get_vendor_product(struct sc_reader *reader,
 	if (!priv)
 		return SC_ERROR_INVALID_ARGUMENTS;
 
-	if (priv->get_tlv_properties && priv->gpriv && priv->gpriv->SCardControl) {
-		if (SCARD_S_SUCCESS != priv->gpriv->SCardControl(card_handle,
-					priv->get_tlv_properties, NULL, 0, rbuf, sizeof(rbuf),
-					&rcount)) {
+	if (priv->get_tlv_properties && priv->gpriv && priv->gpriv->api.SCardControl) {
+		if (SCARD_S_SUCCESS != PCSC_CALL(&priv->gpriv->api, SCardControl, card_handle,
+						       priv->get_tlv_properties, NULL, 0, rbuf, sizeof(rbuf),
+						       &rcount)) {
 			sc_log(reader->ctx,
 					"PC/SC v2 part 10: Get TLV properties failed!");
 			return SC_ERROR_TRANSMIT_FAILED;
@@ -1175,8 +1097,8 @@ static void detect_reader_features(sc_reader_t *reader, SCARDHANDLE card_handle)
 
 	sc_log(ctx, "Requesting reader features ... ");
 
-	if (gpriv->SCardControl) {
-		rv = gpriv->SCardControl(card_handle, CM_IOCTL_GET_FEATURE_REQUEST, NULL, 0, buf, sizeof(buf), &rcount);
+	if (gpriv->api.SCardControl) {
+		rv = PCSC_CALL(&gpriv->api, SCardControl, card_handle, CM_IOCTL_GET_FEATURE_REQUEST, NULL, 0, buf, sizeof(buf), &rcount);
 		if (rv != SCARD_S_SUCCESS) {
 			PCSC_TRACE(reader, "SCardControl failed", rv);
 			return;
@@ -1248,10 +1170,10 @@ static void detect_reader_features(sc_reader_t *reader, SCARDHANDLE card_handle)
 	}
 
 	/* Detect display */
-	if (priv->pin_properties_ioctl && gpriv->SCardControl) {
+	if (priv->pin_properties_ioctl && gpriv->api.SCardControl) {
 		rcount = sizeof(buf);
-		rv = gpriv->SCardControl(card_handle, priv->pin_properties_ioctl,
-			NULL, 0, buf, sizeof(buf), &rcount);
+		rv = PCSC_CALL(&gpriv->api, SCardControl, card_handle, priv->pin_properties_ioctl,
+				NULL, 0, buf, sizeof(buf), &rcount);
 		if (rv == SCARD_S_SUCCESS) {
 #ifdef PIN_PROPERTIES_v5
 			if (rcount == sizeof(PIN_PROPERTIES_STRUCTURE_v5)) {
@@ -1340,20 +1262,20 @@ static void detect_reader_features(sc_reader_t *reader, SCARDHANDLE card_handle)
 				"short length APDUs only");
 	}
 
-	if (gpriv->SCardGetAttrib != NULL) {
+	if (gpriv->api.SCardGetAttrib != NULL) {
 		rcount = sizeof(buf);
-		if (gpriv->SCardGetAttrib(card_handle, SCARD_ATTR_VENDOR_NAME,
-					buf, &rcount) == SCARD_S_SUCCESS
-				&& rcount > 0) {
+		if (PCSC_CALL(&gpriv->api, SCardGetAttrib, card_handle, SCARD_ATTR_VENDOR_NAME,
+				    buf, &rcount) == SCARD_S_SUCCESS &&
+				rcount > 0) {
 			/* add NUL termination, just in case... */
 			buf[(sizeof buf)-1] = '\0';
 			reader->vendor = strdup((char *) buf);
 		}
 
 		rcount = sizeof i;
-		if (gpriv->SCardGetAttrib(card_handle, SCARD_ATTR_VENDOR_IFD_VERSION,
-					(u8 *) &i, &rcount) == SCARD_S_SUCCESS
-				&& rcount == sizeof i) {
+		if (PCSC_CALL(&gpriv->api, SCardGetAttrib, card_handle, SCARD_ATTR_VENDOR_IFD_VERSION,
+				    (u8 *)&i, &rcount) == SCARD_S_SUCCESS &&
+				rcount == sizeof i) {
 			reader->version_major = (i >> 24) & 0xFF;
 			reader->version_minor = (i >> 16) & 0xFF;
 		}
@@ -1446,8 +1368,8 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 			 */
 			rv = SCARD_E_INVALID_HANDLE;
 		} else {
-			rv = gpriv->SCardListReaders(gpriv->pcsc_ctx, NULL,
-					NULL, (LPDWORD) &reader_buf_size);
+			rv = PCSC_CALL(&gpriv->api, SCardListReaders, gpriv->pcsc_ctx, NULL,
+					NULL, (LPDWORD)&reader_buf_size);
 
 			/*
 			 * All readers have disappeared, so mark them as
@@ -1472,7 +1394,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 			}
 
 			if ((rv == (LONG)SCARD_E_NO_SERVICE) || (rv == (LONG)SCARD_E_SERVICE_STOPPED)) {
-				gpriv->SCardReleaseContext(gpriv->pcsc_ctx);
+				PCSC_CALL(&gpriv->api, SCardReleaseContext, gpriv->pcsc_ctx);
 				gpriv->pcsc_ctx = -1;
 				for (i = 0; i < ARRAY_SIZE(gpriv->pcsc_wait_ctx); i++) {
 					gpriv->pcsc_wait_ctx[i] = -1;
@@ -1490,7 +1412,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 
 			sc_log(ctx, "Establish PC/SC context");
 
-			rv = gpriv->SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &gpriv->pcsc_ctx);
+			rv = PCSC_CALL(&gpriv->api, SCardEstablishContext, SCARD_SCOPE_USER, NULL, NULL, &gpriv->pcsc_ctx);
 			if (rv != SCARD_S_SUCCESS) {
 				gpriv->pcsc_ctx = -1;
 				PCSC_LOG(ctx, "SCardEstablishContext failed", rv);
@@ -1509,8 +1431,8 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 		ret = SC_ERROR_OUT_OF_MEMORY;
 		goto out;
 	}
-	rv = gpriv->SCardListReaders(gpriv->pcsc_ctx, mszGroups, reader_buf,
-			(LPDWORD) &reader_buf_size);
+	rv = PCSC_CALL(&gpriv->api, SCardListReaders, gpriv->pcsc_ctx, mszGroups, reader_buf,
+			(LPDWORD)&reader_buf_size);
 	if (rv != SCARD_S_SUCCESS) {
 		PCSC_LOG(ctx, "SCardListReaders failed", rv);
 		ret = pcsc_to_opensc_error(rv);
@@ -1576,18 +1498,18 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 		/* Use DIRECT mode only if there is no card in the reader */
 		if (!(reader->flags & SC_READER_CARD_PRESENT)) {
 #ifndef _WIN32	/* Apple 10.5.7 and pcsc-lite previous to v1.5.5 do not support 0 as protocol identifier */
-			rv = gpriv->SCardConnect(gpriv->pcsc_ctx, reader->name, SCARD_SHARE_DIRECT, SCARD_PROTOCOL_T0|SCARD_PROTOCOL_T1, &card_handle, &active_proto);
+			rv = PCSC_CALL(&gpriv->api, SCardConnect, gpriv->pcsc_ctx, reader->name, SCARD_SHARE_DIRECT, SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &card_handle, &active_proto);
 #else
-			rv = gpriv->SCardConnect(gpriv->pcsc_ctx, reader->name, SCARD_SHARE_DIRECT, 0, &card_handle, &active_proto);
+			rv = PCSC_CALL(&gpriv->api, SCardConnect, gpriv->pcsc_ctx, reader->name, SCARD_SHARE_DIRECT, 0, &card_handle, &active_proto);
 #endif
 			PCSC_TRACE(reader, "SCardConnect(DIRECT)", rv);
 		}
 		if (rv == (LONG)SCARD_E_SHARING_VIOLATION) {
 			/* Assume that there is a card in the reader in shared mode if
 			 * direct communication failed */
-			rv = gpriv->SCardConnect(gpriv->pcsc_ctx, reader->name,
+			rv = PCSC_CALL(&gpriv->api, SCardConnect, gpriv->pcsc_ctx, reader->name,
 					SCARD_SHARE_SHARED,
-					SCARD_PROTOCOL_T0|SCARD_PROTOCOL_T1, &card_handle,
+					SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, &card_handle,
 					&active_proto);
 			PCSC_TRACE(reader, "SCardConnect(SHARED)", rv);
 			reader->active_protocol = pcsc_proto_to_opensc(active_proto);
@@ -1595,7 +1517,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 
 		if (rv == SCARD_S_SUCCESS) {
 			detect_reader_features(reader, card_handle);
-			gpriv->SCardDisconnect(card_handle, SCARD_LEAVE_CARD);
+			PCSC_CALL(&gpriv->api, SCardDisconnect, card_handle, SCARD_LEAVE_CARD);
 		}
 	}
 
@@ -1619,7 +1541,7 @@ pcsc_reader_states_free(sc_context_t *ctx, struct pcsc_reader_states *states)
 		if (ctx) {
 			struct pcsc_global_private_data *gpriv = (struct pcsc_global_private_data *)ctx->reader_drv_data;
 			if (states->pcsc_wait_ctx_index < ARRAY_SIZE(gpriv->pcsc_wait_ctx)) {
-				gpriv->SCardReleaseContext(gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index]);
+				PCSC_CALL(&gpriv->api, SCardReleaseContext, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index]);
 				gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index] = -1;
 			}
 		}
@@ -1748,7 +1670,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 	}
 
 	if (gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index] == (SCARDCONTEXT)-1) {
-		rv = gpriv->SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index]);
+		rv = PCSC_CALL(&gpriv->api, SCardEstablishContext, SCARD_SCOPE_USER, NULL, NULL, &gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index]);
 		if (rv != SCARD_S_SUCCESS) {
 			gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index] = -1;
 			PCSC_LOG(ctx, "SCardEstablishContext(wait) failed", rv);
@@ -1771,7 +1693,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 		goto out;
 	}
 
-	rv = gpriv->SCardGetStatusChange(gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], 0, states->reader_states, num_watch);
+	rv = PCSC_CALL(&gpriv->api, SCardGetStatusChange, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], 0, states->reader_states, num_watch);
 	if (rv != SCARD_S_SUCCESS) {
 		if (rv != (LONG)SCARD_E_TIMEOUT) {
 			PCSC_LOG(ctx, "SCardGetStatusChange(1) failed", rv);
@@ -1878,7 +1800,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 		else
 			dwtimeout = timeout;
 
-		rv = gpriv->SCardGetStatusChange(gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], dwtimeout, states->reader_states, num_watch);
+		rv = PCSC_CALL(&gpriv->api, SCardGetStatusChange, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], dwtimeout, states->reader_states, num_watch);
 
 		if (rv == (LONG)SCARD_E_CANCELLED) {
 			/* pcsc_cancel was called, events don't matter */
@@ -2292,7 +2214,7 @@ pcsc_pin_cmd(sc_reader_t *reader, struct sc_pin_cmd_data *data)
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
 
-	if (priv->gpriv->SCardControl == NULL)
+	if (priv->gpriv->api.SCardControl == NULL)
 		return SC_ERROR_NOT_SUPPORTED;
 
 	/* The APDU must be provided by the card driver */
@@ -2617,7 +2539,7 @@ static void detect_protocol(sc_reader_t *reader, SCARDHANDLE card_handle)
 	unsigned char atr[SC_MAX_ATR_SIZE];
 	struct pcsc_private_data *priv = reader->drv_data;
 	/* attempt to detect protocol in use T0/T1/RAW */
-	DWORD rv = priv->gpriv->SCardStatus(card_handle, NULL,
+	DWORD rv = PCSC_CALL(&priv->gpriv->api, SCardStatus, card_handle, NULL,
 			&readers_len, &state, &prot, atr, &atr_len);
 	if (rv != SCARD_S_SUCCESS) {
 		prot = SCARD_PROTOCOL_T0;
@@ -2638,10 +2560,9 @@ pcsc_check_reader_handles(sc_context_t *ctx, sc_reader_t *reader, void * pcsc_co
 	memset(reader_name, 0, sizeof(reader_name));
 
 	/* check if new handles are for the same reader as old handles */
-	if (SCARD_S_SUCCESS != priv->gpriv->SCardGetAttrib(*(SCARDHANDLE *)pcsc_card_handle,
-				SCARD_ATTR_DEVICE_SYSTEM_NAME_A, (LPBYTE)
-				reader_name, &reader_name_size)
-			|| strcmp(reader_name, reader->name) != 0) {
+	if (SCARD_S_SUCCESS != PCSC_CALL(&priv->gpriv->api, SCardGetAttrib, *(SCARDHANDLE *)pcsc_card_handle,
+					       SCARD_ATTR_DEVICE_SYSTEM_NAME_A, (LPBYTE)reader_name, &reader_name_size) ||
+			strcmp(reader_name, reader->name) != 0) {
 		sc_log(ctx, "Reader name changed from \"%s\" to \"%s\"", reader->name, reader_name);
 
 		return 1;
@@ -2694,9 +2615,8 @@ int pcsc_use_reader(sc_context_t *ctx, void * pcsc_context_handle, void * pcsc_c
 	gpriv->pcsc_ctx = *(SCARDCONTEXT *)pcsc_context_handle;
 	card_handle = *(SCARDHANDLE *)pcsc_card_handle;
 
-	if(SCARD_S_SUCCESS == gpriv->SCardGetAttrib(card_handle,
-				SCARD_ATTR_DEVICE_SYSTEM_NAME_A, (LPBYTE)
-				reader_name, &reader_name_size)) {
+	if (SCARD_S_SUCCESS == PCSC_CALL(&gpriv->api, SCardGetAttrib, card_handle,
+					       SCARD_ATTR_DEVICE_SYSTEM_NAME_A, (LPBYTE)reader_name, &reader_name_size)) {
 		sc_reader_t *reader = NULL;
 
 		ret = pcsc_add_reader(ctx, reader_name, reader_name_size, &reader);

@@ -6,7 +6,7 @@ EXTRA_DIST = Makefile.mak
 
 lib_LTLIBRARIES = libopensc.la
 noinst_HEADERS = cards.h ctbcs.h internal.h muscle.h muscle-filesystem.h \
-	internal-winscard.h pkcs15-syn.h pkcs15-emulator-filter.h \
+	internal-winscard.h pcsc-api.h pkcs15-syn.h pkcs15-emulator-filter.h \
 	opensc.h pkcs15.h gp.h \
 	cardctl.h asn1.h log.h simpletlv.h \
 	errors.h types.h compression.h itacns.h iso7816.h \
@@ -35,7 +35,7 @@ libopensc_la_SOURCES_BASE = \
 	\
 	muscle.c muscle-filesystem.c \
 	\
-	ctbcs.c reader-ctapi.c reader-pcsc.c reader-openct.c reader-tr03119.c reader-empty.c \
+	ctbcs.c reader-ctapi.c reader-pcsc.c pcsc-api.c reader-openct.c reader-tr03119.c reader-empty.c \
 	\
 	card-setcos.c card-flex.c \
 	card-cardos.c card-cardos-common.c card-tcos.c card-default.c \
@@ -117,7 +117,7 @@ TIDY_FILES = \
 	\
 	muscle.c muscle-filesystem.c \
 	\
-	ctbcs.c reader-ctapi.c reader-pcsc.c reader-openct.c reader-tr03119.c reader-empty.c \
+	ctbcs.c reader-ctapi.c reader-pcsc.c pcsc-api.c reader-openct.c reader-tr03119.c reader-empty.c \
 	\
 	card-setcos.c card-flex.c \
 	card-cardos.c card-tcos.c card-default.c \
