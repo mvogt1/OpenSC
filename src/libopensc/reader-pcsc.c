@@ -558,8 +558,8 @@ refresh_attributes_from_pcsc(sc_reader_t *reader)
 }
 
 /* Updates ATR and card flags. With allow_recent, the result of the last
- * check is reused if it is younger than presence_check_interval. A check
- * without allow_recent invalidates it, as the card state may change. */
+ * check is reused if it is younger than presence_check_interval. Without,
+ * PC/SC is always asked. Each successful check is stored for reuse. */
 static int
 refresh_attributes(sc_reader_t *reader, int allow_recent)
 {
@@ -575,7 +575,7 @@ refresh_attributes(sc_reader_t *reader, int allow_recent)
 
 	priv->last_presence_check = 0;
 	r = refresh_attributes_from_pcsc(reader);
-	if (r == SC_SUCCESS && allow_recent)
+	if (r == SC_SUCCESS)
 		priv->last_presence_check = pcsc_now_ms();
 	return r;
 }
@@ -673,6 +673,8 @@ static int pcsc_reconnect(sc_reader_t * reader, DWORD action)
 			protocol, action, &active_proto);
 
 	PCSC_TRACE(reader, "SCardReconnect returned", rv);
+	/* the card may have been reset, its state is not known anymore */
+	priv->last_presence_check = 0;
 	if (rv != SCARD_S_SUCCESS) {
 		PCSC_TRACE(reader, "SCardReconnect failed", rv);
 		return pcsc_to_opensc_error(rv);
@@ -723,7 +725,7 @@ static int pcsc_connect(sc_reader_t *reader)
 
 	LOG_FUNC_CALLED(reader->ctx);
 
-	r = refresh_attributes(reader, 0);
+	r = refresh_attributes(reader, 1);
 	if (r != SC_SUCCESS)
 		LOG_FUNC_RETURN(reader->ctx, r);
 
