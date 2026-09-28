@@ -652,7 +652,11 @@ app <replaceable>application</replaceable> {
 								event poll is answered from the
 								last result instead of asking PC/SC
 								again. Card removal is noticed up
-								to this time later (Default:
+								to this time later. Values above
+								1000 ms are not recommended, as a
+								swapped card could then be
+								connected with the state of the
+								previous card (Default:
 								<literal>0</literal>, always ask
 								PC/SC).
 						</para></listitem>
