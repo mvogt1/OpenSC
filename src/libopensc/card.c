@@ -516,13 +516,16 @@ int sc_unlock(sc_card_t *card)
 		LOG_FUNC_RETURN(card->ctx, r);
 
 	if (card->lock_count < 1) {
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+		sc_log(card->ctx, "card is not locked, sc_unlock() called without prior sc_lock()");
+		r = SC_ERROR_INVALID_ARGUMENTS;
+		goto out;
 	}
 	if (--card->lock_count == 0) {
 		/* release reader lock */
 		if (card->reader->ops->unlock != NULL)
 			r = card->reader->ops->unlock(card->reader);
 	}
+out:
 	r2 = sc_mutex_unlock(card->ctx, card->mutex);
 	if (r2 != SC_SUCCESS) {
 		sc_log(card->ctx, "unable to release lock");
