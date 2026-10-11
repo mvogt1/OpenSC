@@ -130,9 +130,11 @@ sc_get_mf_path
 sc_get_version
 sc_hex_dump
 sc_dump_hex
+sc_dump_lock_stats
 sc_hex_to_bin
 sc_list_files
 sc_lock
+sc_lock_at
 sc_logout
 sc_make_cache_dir
 sc_mem_clear
@@ -276,6 +278,7 @@ sc_set_security_env
 sc_strerror
 sc_transmit_apdu
 sc_unlock
+sc_unlock_at
 sc_unwrap
 sc_update_binary
 sc_update_dir

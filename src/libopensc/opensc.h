@@ -44,6 +44,12 @@ extern "C" {
 #include "libopensc/sm.h"
 #endif
 
+/* Collect sc_lock()/sc_unlock() statistics per call site,
+ * see sc_dump_lock_stats(). Define SC_NO_LOCK_STATS to disable. */
+#ifndef SC_NO_LOCK_STATS
+#define SC_LOCK_STATS
+#endif
+
 #define SC_SEC_OPERATION_DECIPHER	0x0001
 #define SC_SEC_OPERATION_SIGN		0x0002
 #define SC_SEC_OPERATION_AUTHENTICATE	0x0003
@@ -609,6 +615,9 @@ typedef struct sc_card {
 #ifdef ENABLE_SM
 	struct sm_context sm_ctx;
 #endif
+#ifdef SC_LOCK_STATS
+	struct sc_lock_card_stats *lock_stats;
+#endif
 
 	unsigned int magic;
 } sc_card_t;
@@ -893,6 +902,9 @@ typedef struct sc_context {
 
 	unsigned int magic;
 	int disable_hw_pkcs1_padding;
+#ifdef SC_LOCK_STATS
+	struct sc_lock_stats *lock_stats;
+#endif
 } sc_context_t;
 
 /* APDU handling functions */
@@ -1188,6 +1200,26 @@ int sc_lock(struct sc_card *card);
  * @retval SC_SUCCESS on success
  */
 int sc_unlock(struct sc_card *card);
+
+/**
+ * sc_lock() and sc_unlock() with the caller's source file and function,
+ * used as key for the lock statistics.
+ */
+int sc_lock_at(struct sc_card *card, const char *file, const char *func);
+int sc_unlock_at(struct sc_card *card, const char *file, const char *func);
+
+#ifdef SC_LOCK_STATS
+#define sc_lock(card) sc_lock_at((card), __FILE__, __func__)
+#define sc_unlock(card) sc_unlock_at((card), __FILE__, __func__)
+#endif
+
+/**
+ * Writes the sc_lock()/sc_unlock() statistics of the context.
+ * Does nothing unless OPENSC_LOCK_STATS is set: "stderr" writes to stderr,
+ * any other value is the name of a file the statistics are appended to.
+ * @param  ctx  OpenSC context
+ */
+void sc_dump_lock_stats(sc_context_t *ctx);
 
 /**
  * @brief Calculate the maximum size of R-APDU payload (Ne).

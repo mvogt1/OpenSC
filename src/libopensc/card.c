@@ -28,6 +28,7 @@
 #endif
 #include <string.h>
 #include <limits.h>
+#include <time.h>
 
 #include "reader-tr03119.h"
 #include "internal.h"
@@ -174,6 +175,9 @@ static void sc_card_free(sc_card_t *card)
 		card->algorithm_count = 0;
 	}
 
+#ifdef SC_LOCK_STATS
+	free(card->lock_stats);
+#endif
 	if (card->mutex != NULL) {
 		int r = sc_mutex_destroy(card->ctx, card->mutex);
 		if (r != SC_SUCCESS)
@@ -451,11 +455,442 @@ int sc_reset(sc_card_t *card, int do_cold_reset)
 	return r;
 }
 
-int sc_lock(sc_card_t *card)
+#ifdef SC_LOCK_STATS
+/* Lock statistics per sc_lock() call site. A section is the time between
+ * sc_lock() and the matching sc_unlock(). Only outermost sections lock the
+ * reader (e.g. SCardBeginTransaction), nested ones just count. */
+
+#define SC_LOCK_STATS_DEPTH 16
+
+struct sc_lock_site {
+	const char *file;
+	const char *func;
+	unsigned long outer;		/* outermost sections */
+	unsigned long outer_no_apdu;	/* ... without any APDU */
+	unsigned long apdus;		/* APDUs in outermost sections */
+	uint64_t acquire_ns, acquire_max_ns; /* time in sc_lock() */
+	uint64_t held_ns, held_max_ns;	/* time between lock and unlock */
+	unsigned long nested;		/* nested sections */
+	uint64_t nested_held_ns;
+	unsigned long lock_failed;
+	unsigned long unlock_elsewhere;	/* unlocked in another function */
+	unsigned long unlock_unmatched;	/* unlock without lock */
+};
+
+/* Gap between an outermost unlock and the next outermost lock */
+struct sc_lock_gap {
+	const char *unlock_file, *unlock_func;
+	const char *lock_file, *lock_func;
+	unsigned long count;
+	uint64_t gap_ns, gap_min_ns, gap_max_ns;
+};
+
+struct sc_lock_stats {
+	void *mutex;
+	struct sc_lock_site *sites;
+	size_t site_count, site_cap;
+	struct sc_lock_gap *gaps;
+	size_t gap_count, gap_cap;
+	unsigned long apdus_unlocked;
+};
+
+struct sc_lock_frame {
+	const char *file, *func;
+	uint64_t locked_ns;
+	int outer;
+};
+
+struct sc_lock_card_stats {
+	struct sc_lock_frame frames[SC_LOCK_STATS_DEPTH];
+	int depth;
+	unsigned long apdus;		/* APDUs in the current outermost section */
+	const char *unlock_file, *unlock_func; /* last outermost unlock */
+	uint64_t unlock_ns;
+};
+
+static uint64_t lock_stats_now(void)
+{
+#ifdef _WIN32
+	LARGE_INTEGER freq, count;
+
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&count);
+	return (uint64_t)(count.QuadPart / freq.QuadPart) * 1000000000ULL +
+	       (uint64_t)(count.QuadPart % freq.QuadPart) * 1000000000ULL / (uint64_t)freq.QuadPart;
+#else
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+static const char *lock_stats_basename(const char *file)
+{
+	const char *p;
+
+	if (file == NULL)
+		return "?";
+	if ((p = strrchr(file, '/')) != NULL)
+		file = p + 1;
+	if ((p = strrchr(file, '\\')) != NULL)
+		file = p + 1;
+	return file;
+}
+
+static int lock_stats_same(const char *file1, const char *func1, const char *file2, const char *func2)
+{
+	return (file1 == file2 || strcmp(file1, file2) == 0) && (func1 == func2 || strcmp(func1, func2) == 0);
+}
+
+/* Call with st->mutex held */
+static struct sc_lock_site *lock_stats_site(struct sc_lock_stats *st, const char *file, const char *func)
+{
+	struct sc_lock_site *site;
+	size_t i;
+
+	for (i = 0; i < st->site_count; i++)
+		if (lock_stats_same(st->sites[i].file, st->sites[i].func, file, func))
+			return &st->sites[i];
+	if (st->site_count == st->site_cap) {
+		size_t cap = st->site_cap ? 2 * st->site_cap : 64;
+		site = realloc(st->sites, cap * sizeof(*site));
+		if (site == NULL)
+			return NULL;
+		st->sites = site;
+		st->site_cap = cap;
+	}
+	site = &st->sites[st->site_count++];
+	memset(site, 0, sizeof(*site));
+	site->file = file;
+	site->func = func;
+	return site;
+}
+
+/* Call with st->mutex held */
+static struct sc_lock_gap *lock_stats_gap(struct sc_lock_stats *st,
+		const char *unlock_file, const char *unlock_func,
+		const char *lock_file, const char *lock_func)
+{
+	struct sc_lock_gap *gap;
+	size_t i;
+
+	for (i = 0; i < st->gap_count; i++) {
+		gap = &st->gaps[i];
+		if (lock_stats_same(gap->unlock_file, gap->unlock_func, unlock_file, unlock_func) &&
+				lock_stats_same(gap->lock_file, gap->lock_func, lock_file, lock_func))
+			return gap;
+	}
+	if (st->gap_count == st->gap_cap) {
+		size_t cap = st->gap_cap ? 2 * st->gap_cap : 64;
+		gap = realloc(st->gaps, cap * sizeof(*gap));
+		if (gap == NULL)
+			return NULL;
+		st->gaps = gap;
+		st->gap_cap = cap;
+	}
+	gap = &st->gaps[st->gap_count++];
+	memset(gap, 0, sizeof(*gap));
+	gap->unlock_file = unlock_file;
+	gap->unlock_func = unlock_func;
+	gap->lock_file = lock_file;
+	gap->lock_func = lock_func;
+	return gap;
+}
+
+/* Called from sc_lock_at() with card->mutex held */
+static void lock_stats_locked(sc_card_t *card, const char *file, const char *func, int r, uint64_t start)
+{
+	struct sc_lock_stats *st = card->ctx->lock_stats;
+	struct sc_lock_card_stats *cs;
+	struct sc_lock_site *site;
+	struct sc_lock_frame *frame;
+	struct sc_lock_gap *gap;
+	uint64_t now, d;
+	int outer;
+
+	if (st == NULL)
+		return;
+	if (card->lock_stats == NULL && (card->lock_stats = calloc(1, sizeof(*card->lock_stats))) == NULL)
+		return;
+	cs = card->lock_stats;
+	now = lock_stats_now();
+	file = lock_stats_basename(file);
+	outer = r == SC_SUCCESS && card->lock_count == 1;
+
+	sc_mutex_lock(card->ctx, st->mutex);
+	site = lock_stats_site(st, file, func);
+	if (r != SC_SUCCESS) {
+		if (site)
+			site->lock_failed++;
+		goto out;
+	}
+	if (outer) {
+		/* frames left over from unbalanced lock_count changes */
+		cs->depth = 0;
+		cs->apdus = 0;
+		if (site) {
+			d = now - start;
+			site->outer++;
+			site->acquire_ns += d;
+			if (d > site->acquire_max_ns)
+				site->acquire_max_ns = d;
+		}
+		if (cs->unlock_func != NULL &&
+				(gap = lock_stats_gap(st, cs->unlock_file, cs->unlock_func, file, func)) != NULL) {
+			d = start > cs->unlock_ns ? start - cs->unlock_ns : 0;
+			if (gap->count == 0 || d < gap->gap_min_ns)
+				gap->gap_min_ns = d;
+			if (d > gap->gap_max_ns)
+				gap->gap_max_ns = d;
+			gap->gap_ns += d;
+			gap->count++;
+		}
+	} else if (site) {
+		site->nested++;
+	}
+	if (cs->depth < SC_LOCK_STATS_DEPTH) {
+		frame = &cs->frames[cs->depth];
+		frame->file = file;
+		frame->func = func;
+		frame->locked_ns = now;
+		frame->outer = outer;
+	}
+	cs->depth++;
+out:
+	sc_mutex_unlock(card->ctx, st->mutex);
+}
+
+/* Called from sc_unlock_at() with card->mutex held */
+static void lock_stats_unlocked(sc_card_t *card, const char *file, const char *func, int unmatched, uint64_t start)
+{
+	struct sc_lock_stats *st = card->ctx->lock_stats;
+	struct sc_lock_card_stats *cs = card->lock_stats;
+	struct sc_lock_site *site;
+	struct sc_lock_frame *frame;
+	uint64_t now, d;
+
+	if (st == NULL)
+		return;
+	now = lock_stats_now();
+	file = lock_stats_basename(file);
+
+	sc_mutex_lock(card->ctx, st->mutex);
+	if (unmatched || cs == NULL || cs->depth == 0) {
+		if ((site = lock_stats_site(st, file, func)) != NULL)
+			site->unlock_unmatched++;
+		goto out;
+	}
+	cs->depth--;
+	if (cs->depth >= SC_LOCK_STATS_DEPTH)
+		goto out;
+	frame = &cs->frames[cs->depth];
+	if ((site = lock_stats_site(st, frame->file, frame->func)) == NULL)
+		goto out;
+	if (!lock_stats_same(frame->file, frame->func, file, func))
+		site->unlock_elsewhere++;
+	d = start > frame->locked_ns ? start - frame->locked_ns : 0;
+	if (frame->outer) {
+		site->held_ns += d;
+		if (d > site->held_max_ns)
+			site->held_max_ns = d;
+		site->apdus += cs->apdus;
+		if (cs->apdus == 0)
+			site->outer_no_apdu++;
+	} else {
+		site->nested_held_ns += d;
+	}
+	if (card->lock_count == 0) {
+		cs->unlock_file = file;
+		cs->unlock_func = func;
+		cs->unlock_ns = now;
+	}
+out:
+	sc_mutex_unlock(card->ctx, st->mutex);
+}
+
+void sc_lock_stats_apdu(sc_card_t *card)
+{
+	struct sc_lock_stats *st = card->ctx->lock_stats;
+
+	if (st == NULL)
+		return;
+	if (card->lock_stats != NULL && card->lock_stats->depth > 0) {
+		card->lock_stats->apdus++;
+	} else {
+		sc_mutex_lock(card->ctx, st->mutex);
+		st->apdus_unlocked++;
+		sc_mutex_unlock(card->ctx, st->mutex);
+	}
+}
+
+int sc_lock_stats_init(sc_context_t *ctx)
+{
+	const char *env = getenv("OPENSC_LOCK_STATS");
+	struct sc_lock_stats *st;
+	int r;
+
+	if (env == NULL || *env == '\0')
+		return SC_SUCCESS;
+	if ((st = calloc(1, sizeof(*st))) == NULL)
+		return SC_ERROR_OUT_OF_MEMORY;
+	r = sc_mutex_create(ctx, &st->mutex);
+	if (r != SC_SUCCESS) {
+		free(st);
+		return r;
+	}
+	ctx->lock_stats = st;
+	return SC_SUCCESS;
+}
+
+void sc_lock_stats_free(sc_context_t *ctx)
+{
+	struct sc_lock_stats *st = ctx->lock_stats;
+
+	if (st == NULL)
+		return;
+	sc_mutex_destroy(ctx, st->mutex);
+	free(st->sites);
+	free(st->gaps);
+	free(st);
+	ctx->lock_stats = NULL;
+}
+
+static double lock_stats_ms(uint64_t ns)
+{
+	return (double)ns / 1e6;
+}
+
+static int lock_stats_cmp_site(const void *a, const void *b)
+{
+	const struct sc_lock_site *s1 = *(const struct sc_lock_site *const *)a;
+	const struct sc_lock_site *s2 = *(const struct sc_lock_site *const *)b;
+	uint64_t t1 = s1->acquire_ns + s1->held_ns, t2 = s2->acquire_ns + s2->held_ns;
+
+	if (t1 != t2)
+		return t1 < t2 ? 1 : -1;
+	if (s1->outer != s2->outer)
+		return s1->outer < s2->outer ? 1 : -1;
+	return s1->nested < s2->nested ? 1 : s1->nested > s2->nested ? -1 : 0;
+}
+
+static int lock_stats_cmp_gap(const void *a, const void *b)
+{
+	const struct sc_lock_gap *g1 = *(const struct sc_lock_gap *const *)a;
+	const struct sc_lock_gap *g2 = *(const struct sc_lock_gap *const *)b;
+
+	if (g1->count != g2->count)
+		return g1->count < g2->count ? 1 : -1;
+	return g1->gap_ns > g2->gap_ns ? 1 : g1->gap_ns < g2->gap_ns ? -1 : 0;
+}
+
+static void lock_stats_write(FILE *f, sc_context_t *ctx, struct sc_lock_stats *st)
+{
+	const struct sc_lock_site **sites = NULL;
+	const struct sc_lock_gap **gaps = NULL;
+	unsigned long outer = 0, no_apdu = 0, apdus = 0;
+	uint64_t acquire = 0, held = 0;
+	size_t i;
+
+	if (st->site_count && (sites = malloc(st->site_count * sizeof(*sites))) == NULL)
+		return;
+	if (st->gap_count && (gaps = malloc(st->gap_count * sizeof(*gaps))) == NULL) {
+		free(sites);
+		return;
+	}
+	for (i = 0; i < st->site_count; i++)
+		sites[i] = &st->sites[i];
+	for (i = 0; i < st->gap_count; i++)
+		gaps[i] = &st->gaps[i];
+	if (sites)
+		qsort(sites, st->site_count, sizeof(*sites), lock_stats_cmp_site);
+	if (gaps)
+		qsort(gaps, st->gap_count, sizeof(*gaps), lock_stats_cmp_gap);
+
+	fprintf(f, "=== OpenSC lock statistics, app %s, pid %lu ===\n",
+			ctx->app_name ? ctx->app_name : "?",
+#ifdef _WIN32
+			(unsigned long)GetCurrentProcessId());
+#else
+			(unsigned long)getpid());
+#endif
+	fprintf(f, "Lock sites, sorted by total time of outermost sections (times in ms)\n");
+	fprintf(f, "%8s %8s %8s %10s %8s %8s %10s %8s %8s %8s %10s %6s %6s %6s  %s\n",
+			"outer", "no-apdu", "apdus", "acquire", "avg", "max", "held", "avg", "max",
+			"nested", "n-held", "failed", "elsewh", "unmtch", "site");
+	for (i = 0; i < st->site_count; i++) {
+		const struct sc_lock_site *s = sites[i];
+		unsigned long n = s->outer ? s->outer : 1;
+
+		fprintf(f, "%8lu %8lu %8lu %10.3f %8.3f %8.3f %10.3f %8.3f %8.3f %8lu %10.3f %6lu %6lu %6lu  %s:%s\n",
+				s->outer, s->outer_no_apdu, s->apdus,
+				lock_stats_ms(s->acquire_ns), lock_stats_ms(s->acquire_ns / n), lock_stats_ms(s->acquire_max_ns),
+				lock_stats_ms(s->held_ns), lock_stats_ms(s->held_ns / n), lock_stats_ms(s->held_max_ns),
+				s->nested, lock_stats_ms(s->nested_held_ns),
+				s->lock_failed, s->unlock_elsewhere, s->unlock_unmatched,
+				s->file, s->func);
+		outer += s->outer;
+		no_apdu += s->outer_no_apdu;
+		apdus += s->apdus;
+		acquire += s->acquire_ns;
+		held += s->held_ns;
+	}
+	fprintf(f, "%8lu %8lu %8lu %10.3f %8s %8s %10.3f  total, %lu APDUs outside of sections\n",
+			outer, no_apdu, apdus, lock_stats_ms(acquire), "", "", lock_stats_ms(held), st->apdus_unlocked);
+
+	fprintf(f, "Gaps between outermost sections, sorted by count (times in ms)\n");
+	fprintf(f, "%8s %10s %8s %8s %8s  %s\n", "count", "total", "avg", "min", "max", "unlock site -> next lock site");
+	for (i = 0; i < st->gap_count; i++) {
+		const struct sc_lock_gap *g = gaps[i];
+
+		fprintf(f, "%8lu %10.3f %8.3f %8.3f %8.3f  %s:%s -> %s:%s\n",
+				g->count, lock_stats_ms(g->gap_ns), lock_stats_ms(g->gap_ns / g->count),
+				lock_stats_ms(g->gap_min_ns), lock_stats_ms(g->gap_max_ns),
+				g->unlock_file, g->unlock_func, g->lock_file, g->lock_func);
+	}
+	free(sites);
+	free(gaps);
+}
+#endif /* SC_LOCK_STATS */
+
+void sc_dump_lock_stats(sc_context_t *ctx)
+{
+#ifdef SC_LOCK_STATS
+	const char *env = getenv("OPENSC_LOCK_STATS");
+	struct sc_lock_stats *st;
+	FILE *f;
+
+	if (ctx == NULL || (st = ctx->lock_stats) == NULL || env == NULL || *env == '\0')
+		return;
+	if (strcmp(env, "stderr") == 0)
+		f = stderr;
+	else if ((f = fopen(env, "a")) == NULL)
+		return;
+	sc_mutex_lock(ctx, st->mutex);
+	lock_stats_write(f, ctx, st);
+	sc_mutex_unlock(ctx, st->mutex);
+	if (f == stderr)
+		fflush(f);
+	else
+		fclose(f);
+#else
+	(void)ctx;
+#endif
+}
+
+int (sc_lock)(sc_card_t *card)
+{
+	return sc_lock_at(card, NULL, "?");
+}
+
+int sc_lock_at(sc_card_t *card, const char *file, const char *func)
 {
 	int r = 0, r2 = 0;
 	int was_reset = 0;
 	int reader_lock_obtained  = 0;
+#ifdef SC_LOCK_STATS
+	uint64_t start = card && card->ctx->lock_stats ? lock_stats_now() : 0;
+#endif
 
 	if (card == NULL)
 		return SC_ERROR_INVALID_ARGUMENTS;
@@ -479,6 +914,12 @@ int sc_lock(sc_card_t *card)
 	}
 	if (r == 0)
 		card->lock_count++;
+#ifdef SC_LOCK_STATS
+	lock_stats_locked(card, file, func, r, start);
+#else
+	(void)file;
+	(void)func;
+#endif
 
 	r2 = sc_mutex_unlock(card->ctx, card->mutex);
 	if (r2 != SC_SUCCESS) {
@@ -502,9 +943,20 @@ int sc_lock(sc_card_t *card)
 	LOG_FUNC_RETURN(card->ctx, r);
 }
 
-int sc_unlock(sc_card_t *card)
+int (sc_unlock)(sc_card_t *card)
+{
+	return sc_unlock_at(card, NULL, "?");
+}
+
+int sc_unlock_at(sc_card_t *card, const char *file, const char *func)
 {
 	int r, r2;
+#ifdef SC_LOCK_STATS
+	uint64_t start = card && card->ctx->lock_stats ? lock_stats_now() : 0;
+#else
+	(void)file;
+	(void)func;
+#endif
 
 	if (!card)
 		return SC_ERROR_INVALID_ARGUMENTS;
@@ -517,6 +969,9 @@ int sc_unlock(sc_card_t *card)
 
 	if (card->lock_count < 1) {
 		sc_log(card->ctx, "card is not locked, sc_unlock() called without prior sc_lock()");
+#ifdef SC_LOCK_STATS
+		lock_stats_unlocked(card, file, func, 1, start);
+#endif
 		r = SC_ERROR_INVALID_ARGUMENTS;
 		goto out;
 	}
@@ -525,6 +980,9 @@ int sc_unlock(sc_card_t *card)
 		if (card->reader->ops->unlock != NULL)
 			r = card->reader->ops->unlock(card->reader);
 	}
+#ifdef SC_LOCK_STATS
+	lock_stats_unlocked(card, file, func, 0, start);
+#endif
 out:
 	r2 = sc_mutex_unlock(card->ctx, card->mutex);
 	if (r2 != SC_SUCCESS) {

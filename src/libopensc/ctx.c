@@ -995,6 +995,12 @@ int sc_context_create(sc_context_t **ctx_out, const sc_context_param_t *parm)
 		sc_release_context(ctx);
 		return r;
 	}
+	r = sc_lock_stats_init(ctx);
+	if (r != SC_SUCCESS) {
+		del_drvs(&opts);
+		sc_release_context(ctx);
+		return r;
+	}
 
 #if defined(ENABLE_OPENSSL) && defined(OPENSSL_SECURE_MALLOC_SIZE) && !defined(LIBRESSL_VERSION_NUMBER)
 	if (!CRYPTO_secure_malloc_initialized()) {
@@ -1102,6 +1108,8 @@ int sc_release_context(sc_context_t *ctx)
 		return SC_ERROR_INVALID_ARGUMENTS;
 	}
 	SC_FUNC_CALLED(ctx, SC_LOG_DEBUG_VERBOSE);
+	sc_dump_lock_stats(ctx);
+	sc_lock_stats_free(ctx);
 	while (list_size(&ctx->readers)) {
 		sc_reader_t *rdr = (sc_reader_t *) list_get_at(&ctx->readers, 0);
 		_sc_delete_reader(ctx, rdr);
