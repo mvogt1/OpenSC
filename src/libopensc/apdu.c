@@ -365,6 +365,7 @@ sc_single_transmit(struct sc_card *card, struct sc_apdu *apdu)
 
 	sc_log(ctx, "CLA:%X, INS:%X, P1:%X, P2:%X, data(%zu) %p",
 			apdu->cla, apdu->ins, apdu->p1, apdu->p2, apdu->datalen, apdu->data);
+	sc_lock_stats_apdu(card);
 #ifdef ENABLE_SM
 	if (card->sm_ctx.sm_mode == SM_MODE_TRANSMIT
 		   	&& (apdu->flags & SC_APDU_FLAGS_NO_SM) == 0) {

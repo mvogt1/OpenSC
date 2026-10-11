@@ -248,6 +248,17 @@ int sc_mutex_unlock(const sc_context_t *ctx, void *mutex);
  * @return SC_SUCCESS on success and an error code otherwise
  */
 int sc_mutex_destroy(const sc_context_t *ctx, void *mutex);
+
+/* sc_lock()/sc_unlock() statistics, see sc_dump_lock_stats() */
+#ifdef SC_LOCK_STATS
+int sc_lock_stats_init(sc_context_t *ctx);
+void sc_lock_stats_free(sc_context_t *ctx);
+void sc_lock_stats_apdu(sc_card_t *card);
+#else
+#define sc_lock_stats_init(ctx) SC_SUCCESS
+#define sc_lock_stats_free(ctx) do { } while (0)
+#define sc_lock_stats_apdu(card) do { } while (0)
+#endif
 /**
  * Returns a unique id for every thread.
  * @param  ctx  sc_context_t object with the thread context
