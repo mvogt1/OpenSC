@@ -34,6 +34,7 @@
 
 #include "internal.h"
 #include "cardctl.h"
+#include "asn1.h"
 #include <assert.h>
 #include <string.h>
 #include <stdlib.h>
@@ -163,7 +164,8 @@ static int jcop_init(struct sc_card *card)
      // Javacard support extended APDU
      card->caps |= SC_CARD_CAP_APDU_EXT;
 
-     //card->max_send_size = 255;
+     /* writes are sent as short APDUs */
+     card->max_send_size = 255;
 	//card->max_recv_size = 256;
 
      //exit(0);
@@ -405,6 +407,230 @@ static int jcop_create_file(struct sc_card *card, struct sc_file *file) {
      if (r > 0)
           drvdata->selected=SELECT_EF;
      return r;
+}
+
+/*
+ * The security attributes (tag 86) hold one byte per operation:
+ * 00 = always, FF = never, otherwise the PKCS#15 authId of the PIN.
+ * The applet uses authId 03 for the User PIN (reference 1) and
+ * authId 04 for the SO PIN (reference 2).
+ */
+static const struct {
+	u8 auth_id;
+	int pin_ref;
+} jcop4_pins[] = {
+	{ 0x03, 1 },
+	{ 0x04, 2 },
+};
+
+/* EF security attribute bytes, unknown positions are -1 */
+static const int jcop4_ef_ops[] = {
+	SC_AC_OP_READ, SC_AC_OP_UPDATE, SC_AC_OP_WRITE, -1, -1, SC_AC_OP_DELETE
+};
+
+static void jcop4_add_acl(struct sc_file *file, unsigned int op, u8 auth_id)
+{
+	size_t i;
+
+	if (auth_id == 0x00) {
+		sc_file_add_acl_entry(file, op, SC_AC_NONE, SC_AC_KEY_REF_NONE);
+		return;
+	}
+	if (auth_id == 0xFF) {
+		sc_file_add_acl_entry(file, op, SC_AC_NEVER, SC_AC_KEY_REF_NONE);
+		return;
+	}
+	for (i = 0; i < sizeof(jcop4_pins) / sizeof(jcop4_pins[0]); i++) {
+		if (jcop4_pins[i].auth_id == auth_id) {
+			sc_file_add_acl_entry(file, op, SC_AC_CHV, jcop4_pins[i].pin_ref);
+			return;
+		}
+	}
+	sc_file_add_acl_entry(file, op, SC_AC_UNKNOWN, SC_AC_KEY_REF_NONE);
+}
+
+static int jcop4_acl_to_auth_id(const struct sc_file *file, unsigned int op)
+{
+	const struct sc_acl_entry *e = sc_file_get_acl_entry(file, op);
+	size_t i;
+
+	if (e == NULL || e->method == SC_AC_NEVER)
+		return 0xFF;
+	if (e->method == SC_AC_NONE)
+		return 0x00;
+	if (e->method == SC_AC_CHV) {
+		for (i = 0; i < sizeof(jcop4_pins) / sizeof(jcop4_pins[0]); i++)
+			if (jcop4_pins[i].pin_ref == (int)e->key_ref)
+				return jcop4_pins[i].auth_id;
+	}
+	return -1;
+}
+
+/* map the security attributes (tag 86) of an EF to ACLs */
+static void jcop4_sec_attr_to_acl(struct sc_file *file)
+{
+	size_t i;
+
+	if (file->type == SC_FILE_TYPE_DF ||
+			file->sec_attr_len != sizeof(jcop4_ef_ops) / sizeof(jcop4_ef_ops[0]))
+		return;
+	for (i = 0; i < file->sec_attr_len; i++) {
+		if (jcop4_ef_ops[i] >= 0)
+			jcop4_add_acl(file, jcop4_ef_ops[i], file->sec_attr[i]);
+	}
+}
+
+/* map the ACLs of an EF or a key object to the security attributes (tag 86) */
+static int jcop4_acl_to_sec_attr(struct sc_file *file)
+{
+	u8 sec_attr[10];
+	size_t len, i;
+	int r;
+
+	if (file->type == SC_FILE_TYPE_WORKING_EF) {
+		len = sizeof(jcop4_ef_ops) / sizeof(jcop4_ef_ops[0]);
+		for (i = 0; i < len; i++) {
+			r = 0xFF;
+			if (jcop4_ef_ops[i] >= 0)
+				r = jcop4_acl_to_auth_id(file, jcop4_ef_ops[i]);
+			if (r < 0)
+				return SC_ERROR_NOT_SUPPORTED;
+			sec_attr[i] = (u8)r;
+		}
+	} else if (file->type == SC_FILE_TYPE_INTERNAL_EF) {
+		r = jcop4_acl_to_auth_id(file, SC_AC_OP_CRYPTO);
+		if (r < 0)
+			return SC_ERROR_NOT_SUPPORTED;
+		/* the meaning of the single bytes is not documented */
+		len = sizeof sec_attr;
+		memset(sec_attr, 0xFF, len);
+		sec_attr[0] = 0x00;
+		sec_attr[1] = sec_attr[5] = sec_attr[7] = sec_attr[8] = sec_attr[9] = (u8)r;
+	} else {
+		return SC_ERROR_NOT_SUPPORTED;
+	}
+	return sc_file_set_sec_attr(file, sec_attr, len);
+}
+
+static int jcop4_process_fci(struct sc_card *card, struct sc_file *file,
+		const u8 *buf, size_t buflen)
+{
+	int r;
+
+	r = iso_ops->process_fci(card, file, buf, buflen);
+	LOG_TEST_RET(card->ctx, r, "Cannot process FCI");
+
+	jcop4_sec_attr_to_acl(file);
+	return r;
+}
+
+/*
+ * The applet expects a FCP template (62) with the file size in tag 80,
+ * the ISO variant (6F, 81) is rejected.
+ */
+static int jcop4_construct_fci(struct sc_card *card, const sc_file_t *file,
+		u8 *out, size_t *outlen)
+{
+	u8 *p = out;
+	u8 buf[2];
+	int r;
+
+	if (*outlen < 2)
+		return SC_ERROR_BUFFER_TOO_SMALL;
+	if (file->size > 0xFFFF)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	*p++ = 0x62;
+	p++;
+
+	buf[0] = (file->size >> 8) & 0xFF;
+	buf[1] = file->size & 0xFF;
+	r = sc_asn1_put_tag(0x80, buf, 2, p, *outlen - (p - out), &p);
+	LOG_TEST_RET(card->ctx, r, "Cannot encode file size");
+
+	if (file->type_attr_len) {
+		r = sc_asn1_put_tag(0x82, file->type_attr, file->type_attr_len,
+				p, *outlen - (p - out), &p);
+	} else if (file->type == SC_FILE_TYPE_WORKING_EF &&
+			file->ef_structure == SC_FILE_EF_TRANSPARENT) {
+		buf[0] = 0x01;
+		r = sc_asn1_put_tag(0x82, buf, 1, p, *outlen - (p - out), &p);
+	} else {
+		r = SC_ERROR_NOT_SUPPORTED;
+	}
+	LOG_TEST_RET(card->ctx, r, "Cannot encode file descriptor");
+
+	buf[0] = (file->id >> 8) & 0xFF;
+	buf[1] = file->id & 0xFF;
+	r = sc_asn1_put_tag(0x83, buf, 2, p, *outlen - (p - out), &p);
+	LOG_TEST_RET(card->ctx, r, "Cannot encode file id");
+
+	if (file->sec_attr_len) {
+		r = sc_asn1_put_tag(0x86, file->sec_attr, file->sec_attr_len,
+				p, *outlen - (p - out), &p);
+		LOG_TEST_RET(card->ctx, r, "Cannot encode security attributes");
+	}
+	if (p - out - 2 > 0x7F)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	out[1] = (u8)(p - out - 2);
+
+	*outlen = p - out;
+	return SC_SUCCESS;
+}
+
+/*
+ * Create a transparent EF or an RSA key object (internal EF) in the
+ * application DF:
+ *   EF:  00 E0 00 00  62 [80 size] [82 01] [83 fid] [86 6 bytes]
+ *   key: 80 E0 00 07  62 [80 bits] [82 51] [83 fid] [86 10 bytes]
+ */
+static int jcop4_create_file(struct sc_card *card, struct sc_file *file)
+{
+	jcop_private_data_t *drvdata = DRVDATA(card);
+	struct sc_apdu apdu;
+	u8 sbuf[SC_MAX_APDU_BUFFER_SIZE];
+	u8 fdb;
+	size_t len;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	if (drvdata->selected == SELECT_MF || drvdata->selected == SELECT_EFDIR)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_ALLOWED);
+	if (file->type == SC_FILE_TYPE_WORKING_EF &&
+			file->ef_structure != SC_FILE_EF_TRANSPARENT)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+
+	r = jcop4_acl_to_sec_attr(file);
+	LOG_TEST_RET(card->ctx, r, "Cannot set security attributes");
+
+	if (file->type == SC_FILE_TYPE_WORKING_EF) {
+		r = iso_ops->create_file(card, file);
+		LOG_TEST_RET(card->ctx, r, "CREATE FILE failed");
+	} else if (file->type == SC_FILE_TYPE_INTERNAL_EF) {
+		/* the size of a key object is the key length in bits */
+		fdb = 0x51;
+		r = sc_file_set_type_attr(file, &fdb, 1);
+		LOG_TEST_RET(card->ctx, r, "Cannot set file descriptor");
+
+		len = sizeof sbuf;
+		r = card->ops->construct_fci(card, file, sbuf, &len);
+		LOG_TEST_RET(card->ctx, r, "construct_fci() failed");
+
+		/* key objects are created with a proprietary command */
+		sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0xE0, 0x00, 0x07);
+		apdu.cla = 0x80;
+		apdu.data = sbuf;
+		apdu.datalen = len;
+		apdu.lc = len;
+
+		r = sc_transmit_apdu(card, &apdu);
+		LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_RET(card->ctx, r, "CREATE FILE failed");
+	}
+
+	drvdata->selected = SELECT_EF;
+	LOG_FUNC_RETURN(card->ctx, r);
 }
 
 
@@ -711,6 +937,68 @@ static int jcop_generate_key(struct sc_card *card, struct sc_cardctl_jcop_genkey
 }
 */
 
+/*
+ * Generate an RSA key in the key object created last and read the
+ * public key, which the card returns as DER encoded RSAPublicKey.
+ */
+static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genkey *a)
+{
+	struct sc_apdu apdu;
+	u8 sbuf[2];
+	u8 rbuf[1024];
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+
+	if (a->key_bits == 0 || a->key_bits > 0xFFFF)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	sbuf[0] = (a->key_bits >> 8) & 0xFF;
+	sbuf[1] = a->key_bits & 0xFF;
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0x46, 0x00, 0x00);
+	apdu.data = sbuf;
+	apdu.datalen = sizeof(sbuf);
+	apdu.lc = sizeof(sbuf);
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "GENERATE KEY failed");
+
+	/* P1 = 81: read the public key of the generated key */
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0x46, 0x81, 0x00);
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof(rbuf);
+	apdu.le = sizeof(rbuf);
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "Reading public key failed");
+
+	a->pubkey = malloc(apdu.resplen);
+	if (a->pubkey == NULL)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+	memcpy(a->pubkey, rbuf, apdu.resplen);
+	a->pubkey_len = apdu.resplen;
+
+	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+}
+
+static int jcop4_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
+{
+	switch (cmd) {
+	case SC_CARDCTL_GET_DEFAULT_KEY:
+		return jcop_get_default_key(card,
+				(struct sc_cardctl_default_key *) ptr);
+	case SC_CARDCTL_JCOP4_GENERATE_KEY:
+		return jcop4_generate_key(card,
+				(struct sc_cardctl_jcop4_genkey *) ptr);
+	}
+
+	return SC_ERROR_NOT_SUPPORTED;
+}
+
 static int jcop_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
 {
         switch (cmd) {
@@ -810,15 +1098,16 @@ static struct sc_card_driver * sc_get_driver(void)
      jcop_ops.write_binary = jcop_write_binary;
      jcop_ops.update_binary = jcop_update_binary;
      jcop_ops.select_file = jcop4_select_file;
-     jcop_ops.create_file = jcop_create_file;
+     jcop_ops.create_file = jcop4_create_file;
+     jcop_ops.construct_fci = jcop4_construct_fci;
      jcop_ops.delete_file = jcop_delete_file;
      //jcop_ops.list_files = jcop_list_files;
      jcop_ops.set_security_env = jcop4_set_security_env;
      jcop_ops.compute_signature = jcop4_compute_signature;
      jcop_ops.decipher = jcop4_decipher;
      jcop_ops.logout = jcop_logout;
-     jcop_ops.process_fci = jcop_process_fci;
-     jcop_ops.card_ctl = jcop_card_ctl;
+     jcop_ops.process_fci = jcop4_process_fci;
+     jcop_ops.card_ctl = jcop4_card_ctl;
      
      return &jcop_drv;
 }
