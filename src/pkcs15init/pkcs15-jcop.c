@@ -331,6 +331,237 @@ jcop_generate_key(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 
 
 
+/*
+ * Middleware may cache the card contents and check EF 6378 in
+ * the application DF, which has the layout of the minidriver cardcf file:
+ * version, PIN freshness, containers freshness and files freshness, the
+ * last two as 16 bit little endian counters. Increment the counters, so
+ * that it notices changes.
+ */
+#define JCOP4_CARDCF_FID	0x6378
+
+static int
+jcop4_update_cardcf(sc_pkcs15_card_t *p15card, int containers, int files)
+{
+	struct sc_context *ctx = p15card->card->ctx;
+	struct sc_path path;
+	u8 buf[6];
+	unsigned int n;
+	int r;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (p15card->file_app == NULL)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INTERNAL);
+	path = p15card->file_app->path;
+	r = sc_append_file_id(&path, JCOP4_CARDCF_FID);
+	LOG_TEST_RET(ctx, r, "Cannot build cardcf path");
+
+	r = sc_select_file(p15card->card, &path, NULL);
+	if (r == SC_ERROR_FILE_NOT_FOUND)
+		LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+	LOG_TEST_RET(ctx, r, "Cannot select cardcf");
+
+	r = sc_read_binary(p15card->card, 0, buf, sizeof(buf), 0);
+	LOG_TEST_RET(ctx, r, "Cannot read cardcf");
+	if (r != sizeof(buf))
+		LOG_TEST_RET(ctx, SC_ERROR_INVALID_DATA, "Unexpected cardcf length");
+
+	if (containers) {
+		n = (buf[2] | (buf[3] << 8)) + 1;
+		buf[2] = n & 0xFF;
+		buf[3] = (n >> 8) & 0xFF;
+	}
+	if (files) {
+		n = (buf[4] | (buf[5] << 8)) + 1;
+		buf[4] = n & 0xFF;
+		buf[5] = (n >> 8) & 0xFF;
+	}
+	r = sc_update_binary(p15card->card, 0, buf, sizeof(buf), 0);
+	LOG_TEST_RET(ctx, r, "Cannot update cardcf");
+
+	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+}
+
+/*
+ * Private keys are key objects in the application DF, addressed by
+ * key reference only, starting with 0x41.
+ */
+#define JCOP4_KEY_REF_MIN	0x41
+#define JCOP4_KEY_REF_MAX	0xFE
+
+static int
+jcop4_select_key_reference(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
+		sc_pkcs15_prkey_info_t *key_info)
+{
+	if (key_info->key_reference < JCOP4_KEY_REF_MIN)
+		key_info->key_reference = JCOP4_KEY_REF_MIN;
+	if (key_info->key_reference > JCOP4_KEY_REF_MAX)
+		return SC_ERROR_TOO_MANY_OBJECTS;
+	return SC_SUCCESS;
+}
+
+/*
+ * Create the key object. Its size is the key length in bits.
+ */
+static int
+jcop4_create_key(sc_profile_t *profile, sc_pkcs15_card_t *p15card, sc_pkcs15_object_t *obj)
+{
+	struct sc_context *ctx = p15card->card->ctx;
+	sc_pkcs15_prkey_info_t *key_info = (sc_pkcs15_prkey_info_t *) obj->data;
+	struct sc_pkcs15_object *pin_obj = NULL;
+	struct sc_pkcs15_auth_info *auth_info;
+	sc_file_t *keyfile = NULL;
+	int r;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (obj->type != SC_PKCS15_TYPE_PRKEY_RSA)
+		LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "JCOP supports only RSA keys.");
+	if (key_info->modulus_length == 0 || key_info->modulus_length > 0xFFFF)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_INVALID_ARGUMENTS);
+
+	r = sc_pkcs15_find_pin_by_auth_id(p15card, &obj->auth_id, &pin_obj);
+	LOG_TEST_RET(ctx, r, "Cannot find PIN of the private key");
+	auth_info = (struct sc_pkcs15_auth_info *) pin_obj->data;
+
+	keyfile = sc_file_new();
+	if (keyfile == NULL)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_OUT_OF_MEMORY);
+	keyfile->type = SC_FILE_TYPE_INTERNAL_EF;
+	keyfile->id = key_info->key_reference;
+	keyfile->size = key_info->modulus_length;
+	sc_file_add_acl_entry(keyfile, SC_AC_OP_CRYPTO, SC_AC_CHV, auth_info->attrs.pin.reference);
+	sc_file_add_acl_entry(keyfile, SC_AC_OP_GENERATE, SC_AC_CHV, auth_info->attrs.pin.reference);
+
+	/* key objects cannot be selected, authenticate with the path of the DF */
+	keyfile->path = key_info->path;
+	r = sc_pkcs15init_authenticate(profile, p15card, keyfile, SC_AC_OP_GENERATE);
+	LOG_TEST_GOTO_ERR(ctx, r, "Authentication failed");
+
+	r = jcop4_update_cardcf(p15card, 1, 0);
+	LOG_TEST_GOTO_ERR(ctx, r, "Cannot update cardcf");
+
+	r = sc_append_file_id(&keyfile->path, keyfile->id);
+	LOG_TEST_GOTO_ERR(ctx, r, "Cannot build key path");
+	r = sc_pkcs15init_create_file(profile, p15card, keyfile);
+	LOG_TEST_GOTO_ERR(ctx, r, "Cannot create key object");
+
+err:
+	sc_file_free(keyfile);
+	LOG_FUNC_RETURN(ctx, r);
+}
+
+static int
+jcop4_store_key(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
+		sc_pkcs15_object_t *obj, sc_pkcs15_prkey_t *key)
+{
+	return SC_ERROR_NOT_SUPPORTED;
+}
+
+/*
+ * Generate a key pair in the key object created by jcop4_create_key()
+ */
+static int
+jcop4_generate_key(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
+		sc_pkcs15_object_t *obj, sc_pkcs15_pubkey_t *pubkey)
+{
+	struct sc_context *ctx = p15card->card->ctx;
+	sc_pkcs15_prkey_info_t *key_info = (sc_pkcs15_prkey_info_t *) obj->data;
+	struct sc_cardctl_jcop4_genkey args;
+	int r;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if (obj->type != SC_PKCS15_TYPE_PRKEY_RSA)
+		LOG_TEST_RET(ctx, SC_ERROR_NOT_SUPPORTED, "JCOP supports only RSA keys.");
+
+	memset(&args, 0, sizeof(args));
+	args.key_bits = key_info->modulus_length;
+	r = sc_card_ctl(p15card->card, SC_CARDCTL_JCOP4_GENERATE_KEY, &args);
+	LOG_TEST_RET(ctx, r, "Key generation failed");
+
+	pubkey->algorithm = SC_ALGORITHM_RSA;
+	r = sc_pkcs15_decode_pubkey_rsa(ctx, &pubkey->u.rsa, args.pubkey, args.pubkey_len);
+	free(args.pubkey);
+	LOG_TEST_RET(ctx, r, "Cannot decode public key");
+
+	if (pubkey->u.rsa.modulus.len * 8 != key_info->modulus_length)
+		LOG_TEST_RET(ctx, SC_ERROR_INVALID_DATA, "Unexpected modulus length");
+
+	LOG_FUNC_RETURN(ctx, SC_SUCCESS);
+}
+
+/*
+ * Delete the key object of a private key. Other objects are stored in
+ * EFs and deleted by the generic code.
+ */
+static int
+jcop4_delete_object(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
+		sc_pkcs15_object_t *obj, const struct sc_path *path)
+{
+	struct sc_context *ctx = p15card->card->ctx;
+	sc_pkcs15_prkey_info_t *key_info;
+	struct sc_pkcs15_object *pin_obj = NULL;
+	struct sc_pkcs15_auth_info *auth_info;
+	struct sc_path key_path;
+	sc_file_t *keyfile = NULL;
+	int r;
+
+	LOG_FUNC_CALLED(ctx);
+
+	if ((obj->type & SC_PKCS15_TYPE_CLASS_MASK) != SC_PKCS15_TYPE_PRKEY) {
+		r = jcop4_update_cardcf(p15card, 0, 1);
+		LOG_TEST_RET(ctx, r, "Cannot update cardcf");
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
+	}
+	key_info = (sc_pkcs15_prkey_info_t *) obj->data;
+	if (key_info->key_reference < JCOP4_KEY_REF_MIN || key_info->key_reference > JCOP4_KEY_REF_MAX)
+		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Invalid key reference");
+
+	r = sc_pkcs15_find_pin_by_auth_id(p15card, &obj->auth_id, &pin_obj);
+	LOG_TEST_RET(ctx, r, "Cannot find PIN of the private key");
+	auth_info = (struct sc_pkcs15_auth_info *) pin_obj->data;
+
+	keyfile = sc_file_new();
+	if (keyfile == NULL)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_OUT_OF_MEMORY);
+	keyfile->path = key_info->path;
+	sc_file_add_acl_entry(keyfile, SC_AC_OP_DELETE, SC_AC_CHV, auth_info->attrs.pin.reference);
+	r = sc_pkcs15init_authenticate(profile, p15card, keyfile, SC_AC_OP_DELETE);
+	sc_file_free(keyfile);
+	LOG_TEST_RET(ctx, r, "Authentication failed");
+
+	r = jcop4_update_cardcf(p15card, 1, 0);
+	LOG_TEST_RET(ctx, r, "Cannot update cardcf");
+
+	memset(&key_path, 0, sizeof(key_path));
+	key_path.type = SC_PATH_TYPE_FILE_ID;
+	key_path.value[0] = 0x00;
+	key_path.value[1] = key_info->key_reference & 0xFF;
+	key_path.len = 2;
+	r = sc_delete_file(p15card->card, &key_path);
+	LOG_TEST_RET(ctx, r, "Cannot delete key object");
+
+	LOG_FUNC_RETURN(ctx, r);
+}
+
+/*
+ * Called before the generic code stores an object in an EF
+ */
+static int
+jcop4_emu_store_data(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
+		sc_pkcs15_object_t *obj, struct sc_pkcs15_der *data, struct sc_path *path)
+{
+	int r;
+
+	if (data != NULL) {
+		r = jcop4_update_cardcf(p15card, 0, 1);
+		LOG_TEST_RET(p15card->card->ctx, r, "Cannot update cardcf");
+	}
+	return SC_ERROR_NOT_IMPLEMENTED;
+}
+
 static struct sc_pkcs15init_operations sc_pkcs15init_jcop_operations = {
 	jcop_erase_card,
 	NULL,				/* init_card     */
@@ -338,14 +569,15 @@ static struct sc_pkcs15init_operations sc_pkcs15init_jcop_operations = {
 	NULL,				/* create_domain */
 	jcop_select_pin_reference,
 	jcop_create_pin,
-	NULL,				/* select_key_reference */
-	jcop_create_key,
-	jcop_store_key,
-	jcop_generate_key,
+	jcop4_select_key_reference,
+	jcop4_create_key,
+	jcop4_store_key,
+	jcop4_generate_key,
 	NULL, NULL,			/* encode private/public key */
 	NULL,				/* finalize_card */
-	NULL, 				/* delete_object */
-	NULL, NULL, NULL, NULL, NULL,	/* pkcs15init emulation */
+	jcop4_delete_object,
+	NULL, NULL, NULL, NULL,		/* pkcs15init emulation */
+	jcop4_emu_store_data,
 	NULL				/* sanity_check */
 };
 

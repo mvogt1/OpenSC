@@ -86,6 +86,7 @@ enum {
 	 */
 	SC_CARDCTL_JCOP_BASE = _CTL_PREFIX('J', 'C', 'P'),
 	SC_CARDCTL_JCOP_GENERATE_KEY,
+	SC_CARDCTL_JCOP4_GENERATE_KEY,
 
 	/*
 	 * Oberthur specific calls
@@ -418,6 +419,13 @@ struct sc_cardctl_jcop_genkey  {
      sc_path_t pri_file_ref;
      unsigned char *	pubkey;
      size_t		pubkey_len;
+};
+
+struct sc_cardctl_jcop4_genkey {
+	size_t key_bits;
+	/* out: DER encoded RSAPublicKey, to be freed by the caller */
+	unsigned char *pubkey;
+	size_t pubkey_len;
 };
 
 /*

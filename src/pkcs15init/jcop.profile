@@ -2,68 +2,54 @@
 # PKCS15 r/w profile for JCOP cards
 #
 cardinfo {
-    max-pin-length      = 16;
+    max-pin-length      = 10;
+    min-pin-length      = 4;
     pin-encoding        = ascii-numeric;
-    pin-pad-char        = 0x00;
+    pin-pad-char        = 0xFF;
+}
+
+pkcs15 {
+    # EF(TokenInfo) can only be updated with the SO PIN
+    do-last-update      = no;
+}
+
+PIN user-pin {
+    auth-id   = 03;
+    reference = 1;
+}
+
+PIN so-pin {
+    auth-id   = 04;
+    reference = 2;
 }
 
 filesystem {
     DF MF {
         DF PKCS15-AppDF {
-            acl = *=NONE, CREATE=CHV3;
-            EF PKCS15-AODF {
-                file-id         = 502E;
-            }
+            acl = *=NONE;
             EF PKCS15-PrKDF {
-                file-id         = 502C;
+                file-id         = 4400;
             }
             EF PKCS15-PuKDF {
-                file-id         = 502B;
+                file-id         = 4401;
             }
             EF PKCS15-CDF {
-                file-id         = 502D;
+                file-id         = 4404;
             }
             EF PKCS15-DODF {
-                file-id         = 502F;
+                file-id         = 4407;
             }
-            template key-domain {
-                EF private-key {
-                    file-id         = 3000;
-                    acl             = *=NEVER, UPDATE=$PIN, CRYPTO=$PIN,
-                                      ERASE=$SOPIN;
-                }
-                EF extractable-key {
-                    file-id         = 3100;
-                    acl             = *=NEVER, READ=$PIN, UPDATE=$PIN, 
-                      ERASE=$SOPIN;
-                }
-                EF data {
-                    file-id         = 3200;
-                    acl             = *=NEVER, UPDATE=$PIN, READ=NONE, 
-                                      ERASE=$SOPIN;
-		}
-                EF privdata {
-                    file-id         = 3500;
-                    acl             = *=NEVER, UPDATE=$PIN, READ=$PIN, 
-                                      ERASE=$SOPIN;
-                }
-                EF public-key {
-                    file-id         = 3300;
-                    acl             = *=NEVER, UPDATE=$PIN, READ=NONE, 
-                                      ERASE=$SOPIN;
-                }
-                EF certificate {
-                    file-id         = 3400;
-                    acl             = *=NEVER, UPDATE=$PIN, READ=NONE, 
-                                      ERASE=$SOPIN;
-                }
+            EF PKCS15-AODF {
+                file-id         = 4408;
             }
-            EF temp-pubkey {
-                 file-id         = 0000;
-                 acl             = *=NEVER, UPDATE=$PIN, READ=NONE, 
-                                   ERASE=$SOPIN;
+            # Private keys are key objects addressed by key reference,
+            # see pkcs15-jcop.c
+            EF template-public-key {
+                file-id         = 5101;
+                structure       = transparent;
+                acl             = *=NEVER, READ=NONE, UPDATE=$PIN,
+                                  WRITE=$PIN, DELETE=$PIN;
             }
         }
     }
 }
-
