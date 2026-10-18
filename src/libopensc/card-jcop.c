@@ -269,6 +269,11 @@ static int jcop_process_fci(struct sc_card *card, struct sc_file *file,
      
      if (r < 0)
 	  return r;
+     /* the size (tag 80) of a record file does not cover all records */
+     if ((file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE ||
+		     file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE_TLV) &&
+		     file->record_length && file->record_count)
+	  file->size = file->record_length * file->record_count;
      if (file->type != SC_FILE_TYPE_DF) {
 	  if (drvdata->nfiles) {
 	       drvdata->nfiles=-1;
@@ -742,6 +747,7 @@ jcop_read_record(struct sc_card *card, unsigned int rec_nr, unsigned int idx,
 		u8 *buf, size_t count, unsigned long flags)
 {
 	struct sc_apdu apdu;
+	u8 rbuf[256];
 	int r;
 
 
@@ -750,10 +756,11 @@ jcop_read_record(struct sc_card *card, unsigned int rec_nr, unsigned int idx,
 	//printf("JCOP rec_nr:%d idx:%d\n",rec_nr,idx);
 	//	exit(1);
 	if (idx == 0) {
+		/* the applet rejects Le unless it is 00 or the record length */
 		sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0xB2, rec_nr, 0);
-		apdu.le = count;
-		apdu.resplen = count;
-		apdu.resp = buf;
+		apdu.le = sizeof rbuf;
+		apdu.resplen = sizeof rbuf;
+		apdu.resp = rbuf;
 	} else {
    	  // B3 ist not supported (SW1 SW2 == 6A 81)  "Function not supported"
           return SC_ERROR_FILE_END_REACHED;
@@ -769,6 +776,11 @@ jcop_read_record(struct sc_card *card, unsigned int rec_nr, unsigned int idx,
 	LOG_TEST_GOTO_ERR(card->ctx, r, "Card returned error");
 
 	if (idx == 0) {
+	  if (apdu.resplen > count) {
+	       r = SC_ERROR_BUFFER_TOO_SMALL;
+	       LOG_TEST_GOTO_ERR(card->ctx, r, "Record too long");
+	  }
+	  memcpy(buf, rbuf, apdu.resplen);
 	  r = (int)apdu.resplen;
 	} else {
           r=SC_ERROR_INTERNAL;
