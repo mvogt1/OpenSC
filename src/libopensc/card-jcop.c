@@ -106,17 +106,15 @@ static int jcop_match_card(struct sc_card *card)
 }
 
 
-static sc_file_t* jcop_get_mf()
+static sc_file_t* jcop_new_mf(void)
 {
-	static sc_file_t *mf = NULL;
-	if (!mf) {
-		mf = sc_file_new();
-		if (mf) {
-			mf->path = *sc_get_mf_path();
-			mf->id = 0x3F00;
-			mf->type = SC_FILE_TYPE_DF;
-			mf->magic = SC_FILE_MAGIC;
-		}
+	sc_file_t *mf = sc_file_new();
+
+	if (mf) {
+		mf->path = *sc_get_mf_path();
+		mf->id = 0x3F00;
+		mf->type = SC_FILE_TYPE_DF;
+		mf->magic = SC_FILE_MAGIC;
 	}
 	return mf;
 }
@@ -138,9 +136,9 @@ static int jcop_init(struct sc_card *card)
 	  return SC_ERROR_OUT_OF_MEMORY;
      memset(drvdata, 0, sizeof(jcop_private_data_t));
 
-     drvdata->virtmf=jcop_get_mf();
+     drvdata->virtmf=jcop_new_mf();
      if (!drvdata->virtmf) {
-          jcop_finish(card);
+          free(drvdata);
           return SC_ERROR_OUT_OF_MEMORY;
      }
      
@@ -218,7 +216,7 @@ static int jcop4_select_file(struct sc_card *card, const struct sc_path *in_path
 	}
 	if (path.type == SC_PATH_TYPE_PATH && path.len == 0) {
 		/* Selection of MF was requested */
-		sc_file_dup(file_out, jcop_get_mf());
+		sc_file_dup(file_out, drvdata->virtmf);
 		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 	}
      drvdata->selected=SELECT_EF;
