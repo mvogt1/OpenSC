@@ -52,6 +52,8 @@ static struct sc_card_driver jcop_drv = {
 #define SELECT_EF 3
 #define SELECT_UNKNOWN 4
 
+#define JCOP4_MAX_PINS 8
+
 typedef struct jcop_private_data_s 
 {
      struct sc_file *virtmf;
@@ -67,6 +69,12 @@ typedef struct jcop_private_data_s
 
      int has_change_counter;
      size_t change_counter;
+
+     struct {
+          u8 auth_id;
+          int pin_ref;
+     } pins[JCOP4_MAX_PINS];
+     size_t npins;
 } jcop_private_data_t ;
 #define DRVDATA(card)   ((jcop_private_data_t *) ((card)->drv_data))
 
@@ -152,6 +160,38 @@ static void jcop4_read_change_counter(struct sc_card *card)
 	sc_log(card->ctx, "Change counter: %zu", drvdata->change_counter);
 }
 
+/*
+ * The PIN objects have the file id 00<reference> and the file descriptor
+ * (tag 82) starts with 41 <authId>. The authIds are chosen when the token
+ * is personalised, the security attributes of the files refer to them.
+ */
+static void jcop4_read_pins(struct sc_card *card)
+{
+	jcop_private_data_t *drvdata = DRVDATA(card);
+	struct sc_path path;
+	struct sc_file *file;
+	u8 fid[2];
+	int ref, r;
+
+	for (ref = 1; ref <= JCOP4_MAX_PINS; ref++) {
+		fid[0] = 0x00;
+		fid[1] = (u8)ref;
+		sc_path_set(&path, SC_PATH_TYPE_FILE_ID, fid, sizeof fid, 0, -1);
+		file = NULL;
+		r = sc_select_file(card, &path, &file);
+		if (r < 0)
+			break;
+		if (file->type_attr_len >= 2 && file->type_attr[0] == 0x41) {
+			drvdata->pins[drvdata->npins].auth_id = file->type_attr[1];
+			drvdata->pins[drvdata->npins].pin_ref = ref;
+			drvdata->npins++;
+			sc_log(card->ctx, "PIN reference %d has authId %02X",
+					ref, file->type_attr[1]);
+		}
+		sc_file_free(file);
+	}
+}
+
 static int jcop_init(struct sc_card *card)
 {
      jcop_private_data_t *drvdata;
@@ -199,6 +239,7 @@ static int jcop_init(struct sc_card *card)
      card->max_send_size = 255;
 	//card->max_recv_size = 256;
 
+     jcop4_read_pins(card);
      jcop4_read_change_counter(card);
 
      //exit(0);
@@ -448,25 +489,19 @@ static int jcop_create_file(struct sc_card *card, struct sc_file *file) {
 
 /*
  * The security attributes (tag 86) hold one byte per operation:
- * 00 = always, FF = never, otherwise the PKCS#15 authId of the PIN.
- * The applet uses authId 03 for the User PIN (reference 1) and
- * authId 04 for the SO PIN (reference 2).
+ * 00 = always, FF = never, otherwise the PKCS#15 authId of the PIN,
+ * see jcop4_read_pins().
  */
-static const struct {
-	u8 auth_id;
-	int pin_ref;
-} jcop4_pins[] = {
-	{ 0x03, 1 },
-	{ 0x04, 2 },
-};
 
 /* EF security attribute bytes, unknown positions are -1 */
 static const int jcop4_ef_ops[] = {
 	SC_AC_OP_READ, SC_AC_OP_UPDATE, SC_AC_OP_WRITE, -1, -1, SC_AC_OP_DELETE
 };
 
-static void jcop4_add_acl(struct sc_file *file, unsigned int op, u8 auth_id)
+static void jcop4_add_acl(struct sc_card *card, struct sc_file *file,
+		unsigned int op, u8 auth_id)
 {
+	jcop_private_data_t *drvdata = DRVDATA(card);
 	size_t i;
 
 	if (auth_id == 0x00) {
@@ -477,17 +512,19 @@ static void jcop4_add_acl(struct sc_file *file, unsigned int op, u8 auth_id)
 		sc_file_add_acl_entry(file, op, SC_AC_NEVER, SC_AC_KEY_REF_NONE);
 		return;
 	}
-	for (i = 0; i < sizeof(jcop4_pins) / sizeof(jcop4_pins[0]); i++) {
-		if (jcop4_pins[i].auth_id == auth_id) {
-			sc_file_add_acl_entry(file, op, SC_AC_CHV, jcop4_pins[i].pin_ref);
+	for (i = 0; i < drvdata->npins; i++) {
+		if (drvdata->pins[i].auth_id == auth_id) {
+			sc_file_add_acl_entry(file, op, SC_AC_CHV, drvdata->pins[i].pin_ref);
 			return;
 		}
 	}
 	sc_file_add_acl_entry(file, op, SC_AC_UNKNOWN, SC_AC_KEY_REF_NONE);
 }
 
-static int jcop4_acl_to_auth_id(const struct sc_file *file, unsigned int op)
+static int jcop4_acl_to_auth_id(struct sc_card *card, const struct sc_file *file,
+		unsigned int op)
 {
+	jcop_private_data_t *drvdata = DRVDATA(card);
 	const struct sc_acl_entry *e = sc_file_get_acl_entry(file, op);
 	size_t i;
 
@@ -496,15 +533,15 @@ static int jcop4_acl_to_auth_id(const struct sc_file *file, unsigned int op)
 	if (e->method == SC_AC_NONE)
 		return 0x00;
 	if (e->method == SC_AC_CHV) {
-		for (i = 0; i < sizeof(jcop4_pins) / sizeof(jcop4_pins[0]); i++)
-			if (jcop4_pins[i].pin_ref == (int)e->key_ref)
-				return jcop4_pins[i].auth_id;
+		for (i = 0; i < drvdata->npins; i++)
+			if (drvdata->pins[i].pin_ref == (int)e->key_ref)
+				return drvdata->pins[i].auth_id;
 	}
 	return -1;
 }
 
 /* map the security attributes (tag 86) of an EF to ACLs */
-static void jcop4_sec_attr_to_acl(struct sc_file *file)
+static void jcop4_sec_attr_to_acl(struct sc_card *card, struct sc_file *file)
 {
 	size_t i;
 
@@ -513,12 +550,12 @@ static void jcop4_sec_attr_to_acl(struct sc_file *file)
 		return;
 	for (i = 0; i < file->sec_attr_len; i++) {
 		if (jcop4_ef_ops[i] >= 0)
-			jcop4_add_acl(file, jcop4_ef_ops[i], file->sec_attr[i]);
+			jcop4_add_acl(card, file, jcop4_ef_ops[i], file->sec_attr[i]);
 	}
 }
 
 /* map the ACLs of an EF or a key object to the security attributes (tag 86) */
-static int jcop4_acl_to_sec_attr(struct sc_file *file)
+static int jcop4_acl_to_sec_attr(struct sc_card *card, struct sc_file *file)
 {
 	u8 sec_attr[10];
 	size_t len, i;
@@ -529,13 +566,13 @@ static int jcop4_acl_to_sec_attr(struct sc_file *file)
 		for (i = 0; i < len; i++) {
 			r = 0xFF;
 			if (jcop4_ef_ops[i] >= 0)
-				r = jcop4_acl_to_auth_id(file, jcop4_ef_ops[i]);
+				r = jcop4_acl_to_auth_id(card, file, jcop4_ef_ops[i]);
 			if (r < 0)
 				return SC_ERROR_NOT_SUPPORTED;
 			sec_attr[i] = (u8)r;
 		}
 	} else if (file->type == SC_FILE_TYPE_INTERNAL_EF) {
-		r = jcop4_acl_to_auth_id(file, SC_AC_OP_CRYPTO);
+		r = jcop4_acl_to_auth_id(card, file, SC_AC_OP_CRYPTO);
 		if (r < 0)
 			return SC_ERROR_NOT_SUPPORTED;
 		/* the meaning of the single bytes is not documented */
@@ -557,9 +594,10 @@ static int jcop4_process_fci(struct sc_card *card, struct sc_file *file,
 	r = iso_ops->process_fci(card, file, buf, buflen);
 	LOG_TEST_RET(card->ctx, r, "Cannot process FCI");
 
-	jcop4_sec_attr_to_acl(file);
+	jcop4_sec_attr_to_acl(card, file);
 	return r;
 }
+
 
 /*
  * The applet expects a FCP template (62) with the file size in tag 80,
@@ -637,7 +675,7 @@ static int jcop4_create_file(struct sc_card *card, struct sc_file *file)
 			file->ef_structure != SC_FILE_EF_TRANSPARENT)
 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
 
-	r = jcop4_acl_to_sec_attr(file);
+	r = jcop4_acl_to_sec_attr(card, file);
 	LOG_TEST_RET(card->ctx, r, "Cannot set security attributes");
 
 	if (file->type == SC_FILE_TYPE_WORKING_EF) {
