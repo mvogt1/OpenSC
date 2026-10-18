@@ -761,6 +761,51 @@ static int jcop_delete_file(struct sc_card *card, const struct sc_path *path) {
 }
 
 
+/*
+ * MANAGE SECURITY ENVIRONMENT with the key reference first, applet
+ * variant 2 rejects the order of the ISO implementation (6A 80).
+ */
+static int jcop4_mse_set(sc_card_t *card, const sc_security_env_t *env, int se_num)
+{
+	struct sc_apdu apdu;
+	u8 sbuf[6];
+	u8 *p = sbuf;
+	u8 p2;
+	int r;
+
+	switch (env->operation) {
+	case SC_SEC_OPERATION_SIGN:
+		p2 = 0xB6;
+		break;
+	case SC_SEC_OPERATION_DECIPHER:
+		p2 = 0xB8;
+		break;
+	default:
+		return iso_ops->set_security_env(card, env, se_num);
+	}
+	if (se_num > 0 || !(env->flags & SC_SEC_ENV_KEY_REF_PRESENT) ||
+			env->key_ref_len != 1)
+		return iso_ops->set_security_env(card, env, se_num);
+
+	*p++ = 0x84;
+	*p++ = 0x01;
+	*p++ = env->key_ref[0];
+	if (env->flags & SC_SEC_ENV_ALG_REF_PRESENT) {
+		*p++ = 0x80;
+		*p++ = 0x01;
+		*p++ = env->algorithm_ref & 0xFF;
+	}
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0x22, 0x41, p2);
+	apdu.data = sbuf;
+	apdu.datalen = p - sbuf;
+	apdu.lc = apdu.datalen;
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	return sc_check_sw(card, apdu.sw1, apdu.sw2);
+}
+
 static int jcop4_set_security_env(sc_card_t *card,
                                     const sc_security_env_t *env_in,
                                     int se_num)
@@ -849,7 +894,7 @@ static int jcop4_set_security_env(sc_card_t *card,
           printf("invalid_senv !!!!\n");
 		return 0;
 	}
-     r= iso_ops->set_security_env(card,env,se_num);
+     r= jcop4_mse_set(card,env,se_num);
      if (r == 0) {
          drvdata->invalid_senv = 0; 
      }
@@ -913,6 +958,11 @@ static int jcop4_decipher(struct sc_card *card,
 	apdu.data = crgram;
 	apdu.datalen = crgram_len;
 	apdu.lc = crgram_len;
+	/* without extended APDUs the cryptogram is sent with command chaining */
+	if (!(card->caps & SC_CARD_CAP_APDU_EXT) && crgram_len > card->max_send_size) {
+		apdu.cse = SC_APDU_CASE_4_SHORT;
+		apdu.flags |= SC_APDU_FLAGS_CHAINING;
+	}
 
 	apdu.resp = resp;
 	apdu.resplen = sizeof(resp);
