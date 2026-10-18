@@ -594,6 +594,12 @@ static int jcop4_process_fci(struct sc_card *card, struct sc_file *file,
 	r = iso_ops->process_fci(card, file, buf, buflen);
 	LOG_TEST_RET(card->ctx, r, "Cannot process FCI");
 
+	/* the size (tag 80) of a record file does not cover all records */
+	if ((file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE ||
+			file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE_TLV) &&
+			file->record_length && file->record_count)
+		file->size = file->record_length * file->record_count;
+
 	jcop4_sec_attr_to_acl(card, file);
 	return r;
 }
