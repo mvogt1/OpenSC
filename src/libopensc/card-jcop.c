@@ -254,6 +254,10 @@ static int jcop4_select_file(struct sc_card *card, const struct sc_path *in_path
 		sc_file_dup(file_out, drvdata->virtmf);
 		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 	}
+     /* the application DF is flat and some applet configurations
+      * reject SELECT by path */
+     if (path.type == SC_PATH_TYPE_PATH && path.len == 2)
+          path.type = SC_PATH_TYPE_FILE_ID;
      drvdata->selected=SELECT_EF;
 	LOG_FUNC_RETURN(card->ctx, iso_ops->select_file(card, &path, file_out));
 }
