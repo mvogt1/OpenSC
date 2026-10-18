@@ -64,6 +64,9 @@ typedef struct jcop_private_data_s
      int key_ref;
      int algorithm_flags;
      int algorithm;
+
+     int has_change_counter;
+     size_t change_counter;
 } jcop_private_data_t ;
 #define DRVDATA(card)   ((jcop_private_data_t *) ((card)->drv_data))
 
@@ -121,6 +124,34 @@ static sc_file_t* jcop_new_mf(void)
 }
 
 
+/*
+ * EF 6378 in the application DF has the layout of the minidriver cardcf
+ * file: version, PIN freshness, containers freshness and files freshness,
+ * the last two as 16 bit little endian counters. Both counters are
+ * combined into the change counter, it is read once per session.
+ */
+static void jcop4_read_change_counter(struct sc_card *card)
+{
+	jcop_private_data_t *drvdata = DRVDATA(card);
+	struct sc_path path;
+	u8 buf[6];
+	int r;
+
+	sc_format_path("6378", &path);
+	path.type = SC_PATH_TYPE_FILE_ID;
+	r = sc_select_file(card, &path, NULL);
+	if (r == SC_SUCCESS)
+		r = sc_read_binary(card, 0, buf, sizeof buf, 0);
+	if (r != (int)sizeof buf) {
+		sc_log(card->ctx, "No change counter: %d", r);
+		return;
+	}
+	drvdata->change_counter = (size_t)(buf[4] | buf[5] << 8) << 16 |
+			(buf[2] | buf[3] << 8);
+	drvdata->has_change_counter = 1;
+	sc_log(card->ctx, "Change counter: %zu", drvdata->change_counter);
+}
+
 static int jcop_init(struct sc_card *card)
 {
      jcop_private_data_t *drvdata;
@@ -167,6 +198,8 @@ static int jcop_init(struct sc_card *card)
      /* writes are sent as short APDUs */
      card->max_send_size = 255;
 	//card->max_recv_size = 256;
+
+     jcop4_read_change_counter(card);
 
      //exit(0);
      LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
@@ -987,7 +1020,14 @@ static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genk
 
 static int jcop4_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
 {
+	jcop_private_data_t *drvdata = DRVDATA(card);
+
 	switch (cmd) {
+	case SC_CARDCTL_GET_CHANGE_COUNTER:
+		if (!drvdata->has_change_counter)
+			return SC_ERROR_NOT_SUPPORTED;
+		*(size_t *)ptr = drvdata->change_counter;
+		return SC_SUCCESS;
 	case SC_CARDCTL_GET_DEFAULT_KEY:
 		return jcop_get_default_key(card,
 				(struct sc_cardctl_default_key *) ptr);
