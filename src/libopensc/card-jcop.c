@@ -54,6 +54,14 @@ static struct sc_card_driver jcop_drv = {
 
 #define JCOP4_MAX_PINS 8
 
+/*
+ * Applet variants, depending on the installation:
+ * 1: keys from 0x41, public keys in 51xx, extended APDUs
+ * 2: keys from 0x21, public keys in 00<ref + 0x20>, short APDUs only
+ */
+#define JCOP4_VARIANT_1 1
+#define JCOP4_VARIANT_2 2
+
 typedef struct jcop_private_data_s 
 {
      struct sc_file *virtmf;
@@ -66,6 +74,8 @@ typedef struct jcop_private_data_s
      int key_ref;
      int algorithm_flags;
      int algorithm;
+
+     int variant;
 
      int has_change_counter;
      size_t change_counter;
@@ -161,6 +171,36 @@ static void jcop4_read_change_counter(struct sc_card *card)
 }
 
 /*
+ * The data object 0182 (GET DATA 80 CA 01 82) is 02 82 on the applet
+ * installed with the original key layout, other values select variant 2.
+ */
+static void jcop4_read_variant(struct sc_card *card)
+{
+	jcop_private_data_t *drvdata = DRVDATA(card);
+	struct sc_apdu apdu;
+	u8 rbuf[2];
+	int r;
+
+	drvdata->variant = JCOP4_VARIANT_1;
+
+	sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, 0xCA, 0x01, 0x82);
+	apdu.cla = 0x80;
+	apdu.resp = rbuf;
+	apdu.resplen = sizeof rbuf;
+	apdu.le = sizeof rbuf;
+	r = sc_transmit_apdu(card, &apdu);
+	if (r == SC_SUCCESS)
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	if (r == SC_SUCCESS && apdu.resplen == sizeof rbuf &&
+			!(rbuf[0] == 0x02 && rbuf[1] == 0x82))
+		drvdata->variant = JCOP4_VARIANT_2;
+
+	sc_log(card->ctx, "Data object 0182: %s, applet variant %d",
+			r == SC_SUCCESS ? sc_dump_hex(rbuf, apdu.resplen) : sc_strerror(r),
+			drvdata->variant);
+}
+
+/*
  * The PIN objects have the file id 00<reference> and the file descriptor
  * (tag 82) starts with 41 <authId>. The authIds are chosen when the token
  * is personalised, the security attributes of the files refer to them.
@@ -238,6 +278,12 @@ static int jcop_init(struct sc_card *card)
      /* writes are sent as short APDUs */
      card->max_send_size = 255;
 	//card->max_recv_size = 256;
+
+     jcop4_read_variant(card);
+     if (drvdata->variant == JCOP4_VARIANT_2) {
+          card->caps &= ~SC_CARD_CAP_APDU_EXT;
+          card->max_recv_size = 256;
+     }
 
      jcop4_read_pins(card);
      jcop4_read_change_counter(card);
@@ -612,6 +658,7 @@ static int jcop4_process_fci(struct sc_card *card, struct sc_file *file,
 static int jcop4_construct_fci(struct sc_card *card, const sc_file_t *file,
 		u8 *out, size_t *outlen)
 {
+	jcop_private_data_t *drvdata = DRVDATA(card);
 	u8 *p = out;
 	u8 buf[2];
 	int r;
@@ -623,10 +670,14 @@ static int jcop4_construct_fci(struct sc_card *card, const sc_file_t *file,
 	*p++ = 0x62;
 	p++;
 
-	buf[0] = (file->size >> 8) & 0xFF;
-	buf[1] = file->size & 0xFF;
-	r = sc_asn1_put_tag(0x80, buf, 2, p, *outlen - (p - out), &p);
-	LOG_TEST_RET(card->ctx, r, "Cannot encode file size");
+	/* variant 2 takes the key length of a key object from GENERATE */
+	if (file->type != SC_FILE_TYPE_INTERNAL_EF ||
+			drvdata->variant != JCOP4_VARIANT_2) {
+		buf[0] = (file->size >> 8) & 0xFF;
+		buf[1] = file->size & 0xFF;
+		r = sc_asn1_put_tag(0x80, buf, 2, p, *outlen - (p - out), &p);
+		LOG_TEST_RET(card->ctx, r, "Cannot encode file size");
+	}
 
 	if (file->type_attr_len) {
 		r = sc_asn1_put_tag(0x82, file->type_attr, file->type_attr_len,
@@ -1072,11 +1123,59 @@ static int jcop_generate_key(struct sc_card *card, struct sc_cardctl_jcop_genkey
  * Generate an RSA key in the key object created last and read the
  * public key, which the card returns as DER encoded RSAPublicKey.
  */
+/*
+ * Variant 2 returns the public key with 80 B0 <block> 00 in blocks
+ * of 256 bytes, the length is taken from the DER header.
+ */
+static int jcop4_read_generated_key(struct sc_card *card, u8 *rbuf, size_t rbuflen,
+		size_t *len)
+{
+	struct sc_apdu apdu;
+	size_t total = 0, n = 0;
+	unsigned int block;
+	int r;
+
+	for (block = 0; n + 256 <= rbuflen; block++) {
+		sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, 0xB0, block, 0x00);
+		apdu.cla = 0x80;
+		apdu.resp = rbuf + n;
+		apdu.resplen = 256;
+		apdu.le = 256;
+		r = sc_transmit_apdu(card, &apdu);
+		LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_RET(card->ctx, r, "Reading public key failed");
+		n += apdu.resplen;
+
+		if (block == 0) {
+			if (n < 2 || rbuf[0] != 0x30)
+				LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_DATA);
+			if (rbuf[1] < 0x80)
+				total = 2 + rbuf[1];
+			else if (rbuf[1] == 0x81 && n >= 3)
+				total = 3 + rbuf[2];
+			else if (rbuf[1] == 0x82 && n >= 4)
+				total = 4 + (rbuf[2] << 8 | rbuf[3]);
+			else
+				LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_DATA);
+		}
+		if (n >= total || apdu.resplen < 256)
+			break;
+	}
+	if (n < total)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_DATA);
+
+	*len = total;
+	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+}
+
 static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genkey *a)
 {
+	jcop_private_data_t *drvdata = DRVDATA(card);
 	struct sc_apdu apdu;
 	u8 sbuf[2];
 	u8 rbuf[1024];
+	size_t len;
 	int r;
 
 	LOG_FUNC_CALLED(card->ctx);
@@ -1087,6 +1186,8 @@ static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genk
 	sbuf[0] = (a->key_bits >> 8) & 0xFF;
 	sbuf[1] = a->key_bits & 0xFF;
 	sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, 0x46, 0x00, 0x00);
+	if (drvdata->variant == JCOP4_VARIANT_2)
+		apdu.cla = 0x80;
 	apdu.data = sbuf;
 	apdu.datalen = sizeof(sbuf);
 	apdu.lc = sizeof(sbuf);
@@ -1096,24 +1197,47 @@ static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genk
 	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
 	LOG_TEST_RET(card->ctx, r, "GENERATE KEY failed");
 
-	/* P1 = 81: read the public key of the generated key */
-	sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0x46, 0x81, 0x00);
-	apdu.resp = rbuf;
-	apdu.resplen = sizeof(rbuf);
-	apdu.le = sizeof(rbuf);
+	if (drvdata->variant == JCOP4_VARIANT_2) {
+		r = jcop4_read_generated_key(card, rbuf, sizeof(rbuf), &len);
+		LOG_TEST_RET(card->ctx, r, "Reading public key failed");
+	} else {
+		/* P1 = 81: read the public key of the generated key */
+		sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0x46, 0x81, 0x00);
+		apdu.resp = rbuf;
+		apdu.resplen = sizeof(rbuf);
+		apdu.le = sizeof(rbuf);
 
-	r = sc_transmit_apdu(card, &apdu);
-	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
-	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
-	LOG_TEST_RET(card->ctx, r, "Reading public key failed");
+		r = sc_transmit_apdu(card, &apdu);
+		LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_RET(card->ctx, r, "Reading public key failed");
+		len = apdu.resplen;
+	}
 
-	a->pubkey = malloc(apdu.resplen);
+	a->pubkey = malloc(len);
 	if (a->pubkey == NULL)
 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
-	memcpy(a->pubkey, rbuf, apdu.resplen);
-	a->pubkey_len = apdu.resplen;
+	memcpy(a->pubkey, rbuf, len);
+	a->pubkey_len = len;
 
 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+}
+
+static int jcop4_get_key_layout(struct sc_card *card,
+		struct sc_cardctl_jcop4_key_layout *layout)
+{
+	jcop_private_data_t *drvdata = DRVDATA(card);
+
+	if (drvdata->variant == JCOP4_VARIANT_2) {
+		layout->key_ref_min = 0x21;
+		layout->key_ref_max = 0x3F;
+		layout->pubkey_fid_offset = 0x20;
+	} else {
+		layout->key_ref_min = 0x41;
+		layout->key_ref_max = 0xFE;
+		layout->pubkey_fid_offset = 0;
+	}
+	return SC_SUCCESS;
 }
 
 static int jcop4_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
@@ -1132,6 +1256,9 @@ static int jcop4_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
 	case SC_CARDCTL_JCOP4_GENERATE_KEY:
 		return jcop4_generate_key(card,
 				(struct sc_cardctl_jcop4_genkey *) ptr);
+	case SC_CARDCTL_JCOP4_GET_KEY_LAYOUT:
+		return jcop4_get_key_layout(card,
+				(struct sc_cardctl_jcop4_key_layout *) ptr);
 	}
 
 	return SC_ERROR_NOT_SUPPORTED;

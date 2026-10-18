@@ -385,18 +385,28 @@ jcop4_update_cardcf(sc_pkcs15_card_t *p15card, int containers, int files)
 
 /*
  * Private keys are key objects in the application DF, addressed by
- * key reference only, starting with 0x41.
+ * key reference only. The range depends on the applet variant.
  */
-#define JCOP4_KEY_REF_MIN	0x41
-#define JCOP4_KEY_REF_MAX	0xFE
+static int
+jcop4_get_key_layout(sc_pkcs15_card_t *p15card, struct sc_cardctl_jcop4_key_layout *layout)
+{
+	memset(layout, 0, sizeof(*layout));
+	return sc_card_ctl(p15card->card, SC_CARDCTL_JCOP4_GET_KEY_LAYOUT, layout);
+}
 
 static int
 jcop4_select_key_reference(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 		sc_pkcs15_prkey_info_t *key_info)
 {
-	if (key_info->key_reference < JCOP4_KEY_REF_MIN)
-		key_info->key_reference = JCOP4_KEY_REF_MIN;
-	if (key_info->key_reference > JCOP4_KEY_REF_MAX)
+	struct sc_cardctl_jcop4_key_layout layout;
+	int r;
+
+	r = jcop4_get_key_layout(p15card, &layout);
+	LOG_TEST_RET(p15card->card->ctx, r, "Cannot get key layout");
+
+	if (key_info->key_reference < layout.key_ref_min)
+		key_info->key_reference = layout.key_ref_min;
+	if (key_info->key_reference > layout.key_ref_max)
 		return SC_ERROR_TOO_MANY_OBJECTS;
 	return SC_SUCCESS;
 }
@@ -504,6 +514,7 @@ jcop4_delete_object(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 	sc_pkcs15_prkey_info_t *key_info;
 	struct sc_pkcs15_object *pin_obj = NULL;
 	struct sc_pkcs15_auth_info *auth_info;
+	struct sc_cardctl_jcop4_key_layout layout;
 	struct sc_path key_path;
 	sc_file_t *keyfile = NULL;
 	int r;
@@ -516,7 +527,9 @@ jcop4_delete_object(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_SUPPORTED);
 	}
 	key_info = (sc_pkcs15_prkey_info_t *) obj->data;
-	if (key_info->key_reference < JCOP4_KEY_REF_MIN || key_info->key_reference > JCOP4_KEY_REF_MAX)
+	r = jcop4_get_key_layout(p15card, &layout);
+	LOG_TEST_RET(ctx, r, "Cannot get key layout");
+	if (key_info->key_reference < layout.key_ref_min || key_info->key_reference > layout.key_ref_max)
 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Invalid key reference");
 
 	r = sc_pkcs15_find_pin_by_auth_id(p15card, &obj->auth_id, &pin_obj);
@@ -547,18 +560,75 @@ jcop4_delete_object(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 }
 
 /*
+ * On applet variant 2 the public key of a key pair is stored in the EF
+ * 00<key reference + offset>, with the ACLs of the profile template.
+ */
+static int
+jcop4_store_public_key(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
+		sc_pkcs15_object_t *obj, struct sc_pkcs15_der *data, struct sc_path *path,
+		int fid_offset)
+{
+	struct sc_context *ctx = p15card->card->ctx;
+	sc_pkcs15_pubkey_info_t *pubkey_info = (sc_pkcs15_pubkey_info_t *) obj->data;
+	sc_pkcs15_object_t *prkey_obj = NULL;
+	sc_pkcs15_prkey_info_t *prkey_info;
+	sc_file_t *file = NULL;
+	int r, fid;
+
+	LOG_FUNC_CALLED(ctx);
+
+	r = sc_pkcs15_find_prkey_by_id(p15card, &pubkey_info->id, &prkey_obj);
+	if (r == SC_ERROR_OBJECT_NOT_FOUND)
+		LOG_FUNC_RETURN(ctx, SC_ERROR_NOT_IMPLEMENTED);
+	LOG_TEST_RET(ctx, r, "Cannot find the private key");
+	prkey_info = (sc_pkcs15_prkey_info_t *) prkey_obj->data;
+	fid = prkey_info->key_reference + fid_offset;
+	if (fid > 0xFF)
+		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Invalid key reference");
+
+	r = sc_profile_get_file(profile, "template-public-key", &file);
+	LOG_TEST_RET(ctx, r, "No public key template in the profile");
+	file->id = fid;
+	file->size = data->len;
+	file->path = p15card->file_app->path;
+	r = sc_append_file_id(&file->path, fid);
+	LOG_TEST_GOTO_ERR(ctx, r, "Cannot build public key path");
+
+	r = sc_pkcs15init_delete_by_path(profile, p15card, &file->path);
+	if (r != SC_ERROR_FILE_NOT_FOUND)
+		LOG_TEST_GOTO_ERR(ctx, r, "Cannot delete public key file");
+	r = sc_pkcs15init_update_file(profile, p15card, file, data->value, data->len);
+	LOG_TEST_GOTO_ERR(ctx, r, "Cannot store public key");
+
+	*path = file->path;
+err:
+	sc_file_free(file);
+	LOG_FUNC_RETURN(ctx, r);
+}
+
+/*
  * Called before the generic code stores an object in an EF
  */
 static int
 jcop4_emu_store_data(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
 		sc_pkcs15_object_t *obj, struct sc_pkcs15_der *data, struct sc_path *path)
 {
+	struct sc_cardctl_jcop4_key_layout layout;
 	int r;
 
-	if (data != NULL) {
-		r = jcop4_update_cardcf(p15card, 0, 1);
-		LOG_TEST_RET(p15card->card->ctx, r, "Cannot update cardcf");
-	}
+	if (data == NULL)
+		return SC_ERROR_NOT_IMPLEMENTED;
+
+	r = jcop4_update_cardcf(p15card, 0, 1);
+	LOG_TEST_RET(p15card->card->ctx, r, "Cannot update cardcf");
+
+	if ((obj->type & SC_PKCS15_TYPE_CLASS_MASK) == SC_PKCS15_TYPE_PUBKEY &&
+			p15card->file_app != NULL &&
+			jcop4_get_key_layout(p15card, &layout) == SC_SUCCESS &&
+			layout.pubkey_fid_offset)
+		return jcop4_store_public_key(p15card, profile, obj, data, path,
+				layout.pubkey_fid_offset);
+
 	return SC_ERROR_NOT_IMPLEMENTED;
 }
 
