@@ -34,6 +34,8 @@
 #include "profile.h"
 
 #define JCOP_MAX_PINS            3
+#define JCOP_USER_PIN_REF        1
+#define JCOP_SO_PIN_REF          2
 
 /*
  * Erase the card
@@ -45,88 +47,105 @@ jcop_erase_card(struct sc_profile *pro, sc_pkcs15_card_t *p15card) {
 }
 
 
+/*
+ * The PKCS#15 application DF is the applet instance itself. It is created
+ * when the applet is installed with GlobalPlatform, which needs the card
+ * manager keys, so it cannot be created here. Accept it if it exists.
+ */
 static int
 jcop_create_dir(sc_profile_t *profile, sc_pkcs15_card_t *p15card, sc_file_t *file)
 {
-     return SC_ERROR_NOT_SUPPORTED;
-};
+	struct sc_card *card = p15card->card;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+	if (file->type != SC_FILE_TYPE_DF)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+
+	r = sc_select_file(card, &file->path, NULL);
+	if (r == SC_ERROR_FILE_NOT_FOUND)
+		sc_log(card->ctx, "DF missing, the PKCS#15 applet is not installed");
+	LOG_FUNC_RETURN(card->ctx, r);
+}
 
 
 /*
  * Select a PIN reference
+ *
+ * The applet has two PINs, both set when the applet is installed:
+ * the user PIN with reference 1 and the SO PIN with reference 2.
  */
 static int
 jcop_select_pin_reference(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
-                sc_pkcs15_auth_info_t *auth_info) {
-        int     preferred, current;
+		sc_pkcs15_auth_info_t *auth_info)
+{
+	int preferred;
 
 	if (auth_info->auth_type != SC_PKCS15_PIN_AUTH_TYPE_PIN)
 		return SC_ERROR_OBJECT_NOT_VALID;
 
-        if ((current = auth_info->attrs.pin.reference) < 0)
-                current = 0;
+	if (auth_info->attrs.pin.flags & SC_PKCS15_PIN_FLAG_SO_PIN)
+		preferred = JCOP_SO_PIN_REF;
+	else
+		preferred = JCOP_USER_PIN_REF;
 
-        if (auth_info->attrs.pin.flags & SC_PKCS15_PIN_FLAG_SO_PIN) {
-	     preferred = 3;
-	} else {
-	     preferred = current;
-	      if (preferred < 1)
-		   preferred=1;
-	      if (preferred > 2)
-		   return SC_ERROR_TOO_MANY_OBJECTS;
-	}
-	if (current > preferred)
-	     return SC_ERROR_TOO_MANY_OBJECTS;
-        auth_info->attrs.pin.reference = preferred;
-        return 0;
+	if (auth_info->attrs.pin.reference > preferred)
+		return SC_ERROR_TOO_MANY_OBJECTS;
+	auth_info->attrs.pin.reference = preferred;
+	return SC_SUCCESS;
 }
 
 /*
  * Store a PIN
+ *
+ * The PIN values are set by the GlobalPlatform install of the applet and
+ * there is no separate PUK. Only verify the given PIN, so a wrong PIN is
+ * caught before the PIN object is written to the AODF. Change a PIN later
+ * with CHANGE REFERENCE DATA (pkcs15-tool --change-pin).
  */
 static int
 jcop_create_pin(sc_profile_t *profile, sc_pkcs15_card_t *p15card, sc_file_t *df,
-                sc_pkcs15_object_t *pin_obj,
-                const unsigned char *pin, size_t pin_len,
-                const unsigned char *puk, size_t puk_len)
+		sc_pkcs15_object_t *pin_obj,
+		const unsigned char *pin, size_t pin_len,
+		const unsigned char *puk, size_t puk_len)
 {
-        sc_pkcs15_auth_info_t *auth_info = (sc_pkcs15_auth_info_t *) pin_obj->data;
+	struct sc_card *card = p15card->card;
+	sc_pkcs15_auth_info_t *auth_info = (sc_pkcs15_auth_info_t *) pin_obj->data;
 	struct sc_pkcs15_pin_attributes *pin_attrs = &auth_info->attrs.pin;
-        unsigned char   nulpin[16];
-        unsigned char   padpin[16];
-        int             r;
+	struct sc_pin_cmd_data data;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
 
 	if (auth_info->auth_type != SC_PKCS15_PIN_AUTH_TYPE_PIN)
-		return SC_ERROR_OBJECT_NOT_VALID;
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_OBJECT_NOT_VALID);
+	if (pin_attrs->reference != JCOP_USER_PIN_REF &&
+			pin_attrs->reference != JCOP_SO_PIN_REF)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
 
-        if (pin_attrs->flags & SC_PKCS15_PIN_FLAG_SO_PIN) {
-                /* SO PIN reference must be 0 */
-                if (pin_attrs->reference != 3)
-                        return SC_ERROR_INVALID_ARGUMENTS;
-        } else {
-                if (pin_attrs->reference >= 3)
-                        return SC_ERROR_TOO_MANY_OBJECTS;
-        }
-        if (puk != NULL && puk_len > 0) {
-	     return SC_ERROR_NOT_SUPPORTED;
-	}
-	r = sc_select_file(p15card->card, &df->path, NULL);
-        if (r < 0)
-	     return r;
+	if (puk != NULL && puk_len > 0)
+		sc_log(card->ctx, "The applet has no PUK, the PUK is ignored");
 
-	/* Current PIN is 00:00:00:00:00:00:00:00... */
-        memset(nulpin, 0, sizeof(nulpin));
-        memset(padpin, 0, sizeof(padpin));
-	memcpy(padpin, pin, pin_len);
-        r = sc_change_reference_data(p15card->card, SC_AC_CHV,
-                        pin_attrs->reference,
-                        nulpin, sizeof(nulpin),
-                        padpin, sizeof(padpin), NULL);
-        if (r < 0)
-                return r;
+	if (pin == NULL || pin_len == 0)
+		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 
-	pin_attrs->flags &= ~SC_PKCS15_PIN_FLAG_LOCAL;
-        return r;
+	r = sc_select_file(card, &df->path, NULL);
+	LOG_TEST_RET(card->ctx, r, "Cannot select application DF");
+
+	memset(&data, 0, sizeof data);
+	data.cmd = SC_PIN_CMD_VERIFY;
+	data.pin_type = SC_AC_CHV;
+	data.pin_reference = pin_attrs->reference;
+	data.pin1.data = pin;
+	data.pin1.len = pin_len;
+	data.pin1.pad_char = pin_attrs->pad_char;
+	data.pin1.pad_length = pin_attrs->max_length;
+	data.flags = SC_PIN_CMD_NEED_PADDING;
+
+	r = sc_pin_cmd(card, &data);
+	LOG_TEST_RET(card->ctx, r, "PIN does not match the PIN set at applet install");
+
+	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
 
 /*
@@ -632,6 +651,144 @@ jcop4_emu_store_data(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
 	return SC_ERROR_NOT_IMPLEMENTED;
 }
 
+/*
+ * The card has no EF(DIR), the application is selected by its AID.
+ */
+static int
+jcop4_emu_update_dir(struct sc_profile *profile, struct sc_pkcs15_card *p15card,
+		struct sc_app_info *app)
+{
+	sc_log(p15card->card->ctx, "No EF(DIR) on this card, skipped");
+	return SC_SUCCESS;
+}
+
+/*
+ * Write one object as record rec_nr of a linear variable TLV record EF.
+ * The record holds a simple TLV: [record number] [length] [DER object],
+ * an empty record is 00 00.
+ */
+static int
+jcop4_write_df_record(struct sc_card *card, unsigned int rec_nr,
+		const u8 *obj, size_t obj_len, size_t max_rec_len)
+{
+	u8 rec[SC_MAX_APDU_BUFFER_SIZE];
+	size_t len = 0;
+
+	if (obj_len > 0) {
+		if (obj_len < 0xFF) {
+			rec[len++] = (u8)rec_nr;
+			rec[len++] = (u8)obj_len;
+		} else {
+			rec[len++] = (u8)rec_nr;
+			rec[len++] = 0xFF;
+			rec[len++] = (obj_len >> 8) & 0xFF;
+			rec[len++] = obj_len & 0xFF;
+		}
+	} else {
+		rec[len++] = 0x00;
+		rec[len++] = 0x00;
+	}
+	if (len + obj_len > max_rec_len || len + obj_len > sizeof rec)
+		return SC_ERROR_FILE_TOO_SMALL;
+	if (obj_len)
+		memcpy(rec + len, obj, obj_len);
+	len += obj_len;
+
+	return sc_update_record(card, rec_nr, 0, rec, len, SC_RECORD_BY_REC_NR);
+}
+
+/*
+ * The applet keeps the AODF and some other DFs in linear variable TLV
+ * record EFs, one object per record. pkcs15init writes a DF with one
+ * UPDATE BINARY, which the card rejects for record EFs. Rewrite all
+ * records of such a DF instead; other DFs are written the normal way.
+ */
+static int
+jcop4_emu_update_any_df(struct sc_profile *profile, struct sc_pkcs15_card *p15card,
+		unsigned op, struct sc_pkcs15_object *object)
+{
+	struct sc_card *card = p15card->card;
+	struct sc_pkcs15_df *df = object ? object->df : NULL;
+	struct sc_pkcs15_object *o;
+	struct sc_file *file = NULL;
+	unsigned char *buf = NULL;
+	const u8 *p, *obj;
+	size_t buflen = 0, left, obj_len, skip = 0, n;
+	unsigned int cla_out, tag_out, rec_nr = 1;
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+	if (df == NULL)
+		LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+
+	r = sc_select_file(card, &df->path, &file);
+	LOG_TEST_RET(card->ctx, r, "Cannot select DF");
+
+	if (file->ef_structure != SC_FILE_EF_LINEAR_VARIABLE_TLV) {
+		sc_file_free(file);
+		/* the object is removed from the DF after this call */
+		if (op == SC_AC_OP_ERASE)
+			LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+		r = sc_pkcs15init_update_any_df(p15card, profile, df, 0);
+		LOG_FUNC_RETURN(card->ctx, r);
+	}
+
+	/* the object to erase is still part of the DF, find its position */
+	if (op == SC_AC_OP_ERASE) {
+		for (o = p15card->obj_list, n = 1; o != NULL; o = o->next) {
+			if (o->df != df)
+				continue;
+			if (o == object) {
+				skip = n;
+				break;
+			}
+			n++;
+		}
+	}
+
+	r = sc_pkcs15init_authenticate(profile, p15card, file, SC_AC_OP_UPDATE);
+	LOG_TEST_GOTO_ERR(card->ctx, r, "Cannot authenticate for DF update");
+
+	r = sc_pkcs15_encode_df(card->ctx, p15card, df, &buf, &buflen);
+	LOG_TEST_GOTO_ERR(card->ctx, r, "Cannot encode DF");
+
+	p = buf;
+	left = buflen;
+	for (n = 1; left > 0 && *p != 0x00 && *p != 0xFF; n++) {
+		obj = p;
+		r = sc_asn1_read_tag(&p, left, &cla_out, &tag_out, &obj_len);
+		if (r != SC_SUCCESS || p == NULL) {
+			r = SC_ERROR_INVALID_DATA;
+			LOG_TEST_GOTO_ERR(card->ctx, r, "Cannot split DF into objects");
+		}
+		obj_len += p - obj;
+		p = obj + obj_len;
+		left -= obj_len;
+		if (n == skip)
+			continue;
+
+		if (rec_nr > file->record_count) {
+			r = SC_ERROR_FILE_TOO_SMALL;
+			LOG_TEST_GOTO_ERR(card->ctx, r, "No free record in DF");
+		}
+		r = jcop4_write_df_record(card, rec_nr, obj, obj_len, file->record_length);
+		LOG_TEST_GOTO_ERR(card->ctx, r, "Cannot write object record");
+		rec_nr++;
+	}
+
+	/* clear the records of objects that are gone */
+	for (; rec_nr <= file->record_count; rec_nr++) {
+		r = jcop4_write_df_record(card, rec_nr, NULL, 0, file->record_length);
+		LOG_TEST_GOTO_ERR(card->ctx, r, "Cannot clear record");
+	}
+	r = SC_SUCCESS;
+
+err:
+	free(buf);
+	sc_file_free(file);
+	LOG_FUNC_RETURN(card->ctx, r);
+}
+
 static struct sc_pkcs15init_operations sc_pkcs15init_jcop_operations = {
 	jcop_erase_card,
 	NULL,				/* init_card     */
@@ -646,7 +803,9 @@ static struct sc_pkcs15init_operations sc_pkcs15init_jcop_operations = {
 	NULL, NULL,			/* encode private/public key */
 	NULL,				/* finalize_card */
 	jcop4_delete_object,
-	NULL, NULL, NULL, NULL,		/* pkcs15init emulation */
+	jcop4_emu_update_dir,
+	jcop4_emu_update_any_df,
+	NULL, NULL,			/* emu_update_tokeninfo, emu_write_info */
 	jcop4_emu_store_data,
 	NULL				/* sanity_check */
 };
