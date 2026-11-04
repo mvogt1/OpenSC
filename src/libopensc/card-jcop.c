@@ -651,6 +651,37 @@ static int jcop4_process_fci(struct sc_card *card, struct sc_file *file,
 }
 
 
+/* default number of records of a record EF */
+#define JCOP4_DEFAULT_RECORD_COUNT	10
+#define JCOP4_MAX_RECORD_LENGTH		0xFE
+
+static int jcop4_is_record_ef(const sc_file_t *file)
+{
+	return file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE ||
+		file->ef_structure == SC_FILE_EF_LINEAR_VARIABLE_TLV;
+}
+
+/*
+ * File descriptor of a linear variable record EF:
+ *   82 06 05 21 [max record length, 2 bytes] [number of records, 2 bytes]
+ */
+static int jcop4_put_record_descriptor(const sc_file_t *file, u8 **p, size_t left)
+{
+	size_t reclen = file->record_length ? file->record_length : JCOP4_MAX_RECORD_LENGTH;
+	size_t count = file->record_count ? file->record_count : JCOP4_DEFAULT_RECORD_COUNT;
+	u8 buf[6];
+
+	if (reclen > JCOP4_MAX_RECORD_LENGTH || count > 0xFFFF)
+		return SC_ERROR_INVALID_ARGUMENTS;
+	buf[0] = 0x05;
+	buf[1] = 0x21;
+	buf[2] = (reclen >> 8) & 0xFF;
+	buf[3] = reclen & 0xFF;
+	buf[4] = (count >> 8) & 0xFF;
+	buf[5] = count & 0xFF;
+	return sc_asn1_put_tag(0x82, buf, sizeof buf, *p, left, p);
+}
+
 /*
  * The applet expects a FCP template (62) with the file size in tag 80,
  * the ISO variant (6F, 81) is rejected.
@@ -686,6 +717,9 @@ static int jcop4_construct_fci(struct sc_card *card, const sc_file_t *file,
 			file->ef_structure == SC_FILE_EF_TRANSPARENT) {
 		buf[0] = 0x01;
 		r = sc_asn1_put_tag(0x82, buf, 1, p, *outlen - (p - out), &p);
+	} else if (file->type == SC_FILE_TYPE_WORKING_EF &&
+			jcop4_is_record_ef(file)) {
+		r = jcop4_put_record_descriptor(file, &p, *outlen - (p - out));
 	} else {
 		r = SC_ERROR_NOT_SUPPORTED;
 	}
@@ -710,9 +744,10 @@ static int jcop4_construct_fci(struct sc_card *card, const sc_file_t *file,
 }
 
 /*
- * Create a transparent EF or an RSA key object (internal EF) in the
- * application DF:
+ * Create a transparent EF, a linear variable record EF or an RSA key
+ * object (internal EF) in the application DF:
  *   EF:  00 E0 00 00  62 [80 size] [82 01] [83 fid] [86 6 bytes]
+ *   rec: 00 E0 00 00  62 [80 size] [82 05 21 reclen count] [83 fid] [86 6 bytes]
  *   key: 80 E0 00 07  62 [80 bits] [82 51] [83 fid] [86 10 bytes]
  */
 static int jcop4_create_file(struct sc_card *card, struct sc_file *file)
@@ -729,7 +764,8 @@ static int jcop4_create_file(struct sc_card *card, struct sc_file *file)
 	if (drvdata->selected == SELECT_MF || drvdata->selected == SELECT_EFDIR)
 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_ALLOWED);
 	if (file->type == SC_FILE_TYPE_WORKING_EF &&
-			file->ef_structure != SC_FILE_EF_TRANSPARENT)
+			file->ef_structure != SC_FILE_EF_TRANSPARENT &&
+			!jcop4_is_record_ef(file))
 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
 
 	r = jcop4_acl_to_sec_attr(card, file);
