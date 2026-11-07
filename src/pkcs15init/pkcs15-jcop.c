@@ -573,14 +573,20 @@ jcop4_delete_object(sc_profile_t *profile, sc_pkcs15_card_t *p15card,
 	key_path.value[1] = key_info->key_reference & 0xFF;
 	key_path.len = 2;
 	r = sc_delete_file(p15card->card, &key_path);
+	/* an earlier attempt may have deleted the key object already,
+	 * go on and remove the PrKDF entry */
+	if (r == SC_ERROR_FILE_NOT_FOUND)
+		r = SC_SUCCESS;
 	LOG_TEST_RET(ctx, r, "Cannot delete key object");
 
 	LOG_FUNC_RETURN(ctx, r);
 }
 
 /*
- * On applet variant 2 the public key of a key pair is stored in the EF
- * 00<key reference + offset>, with the ACLs of the profile template.
+ * The public key of a key pair is stored in the EF <key reference + offset>
+ * with the ACLs of the profile template: 51<key reference> on applet
+ * variant 1, 00<key reference + 0x20> on variant 2. The template file id
+ * 5101 itself cannot be used, the applet selects PIN 1 for it.
  */
 static int
 jcop4_store_public_key(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
@@ -602,7 +608,7 @@ jcop4_store_public_key(sc_pkcs15_card_t *p15card, sc_profile_t *profile,
 	LOG_TEST_RET(ctx, r, "Cannot find the private key");
 	prkey_info = (sc_pkcs15_prkey_info_t *) prkey_obj->data;
 	fid = prkey_info->key_reference + fid_offset;
-	if (fid > 0xFF)
+	if (fid > 0xFFFF)
 		LOG_TEST_RET(ctx, SC_ERROR_INVALID_ARGUMENTS, "Invalid key reference");
 
 	r = sc_profile_get_file(profile, "template-public-key", &file);
@@ -726,10 +732,13 @@ jcop4_emu_update_any_df(struct sc_profile *profile, struct sc_pkcs15_card *p15ca
 
 	if (file->ef_structure != SC_FILE_EF_LINEAR_VARIABLE_TLV) {
 		sc_file_free(file);
-		/* the object is removed from the DF after this call */
+		/* the caller removes the object to erase after this call,
+		 * write the DF without it */
 		if (op == SC_AC_OP_ERASE)
-			LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+			sc_pkcs15_remove_object(p15card, object);
 		r = sc_pkcs15init_update_any_df(p15card, profile, df, 0);
+		if (op == SC_AC_OP_ERASE)
+			sc_pkcs15_add_object(p15card, object);
 		LOG_FUNC_RETURN(card->ctx, r);
 	}
 

@@ -312,6 +312,7 @@ static int jcop4_select_file(struct sc_card *card, const struct sc_path *in_path
 {
 	struct sc_path path = *in_path;
      jcop_private_data_t *drvdata=DRVDATA(card);
+	int r;
 
 	LOG_FUNC_CALLED(card->ctx);
 	if (path.aid.len == sizeof jcop_aid && 0 == memcmp(path.aid.value, jcop_aid, sizeof jcop_aid)) {
@@ -346,7 +347,11 @@ static int jcop4_select_file(struct sc_card *card, const struct sc_path *in_path
      if (path.type == SC_PATH_TYPE_PATH && path.len == 2)
           path.type = SC_PATH_TYPE_FILE_ID;
      drvdata->selected=SELECT_EF;
-	LOG_FUNC_RETURN(card->ctx, iso_ops->select_file(card, &path, file_out));
+	r = iso_ops->select_file(card, &path, file_out);
+	/* the applet answers 6A81 instead of 6A82 for a missing file */
+	if (r == SC_ERROR_NO_CARD_SUPPORT)
+		r = SC_ERROR_FILE_NOT_FOUND;
+	LOG_FUNC_RETURN(card->ctx, r);
 }
 
 static int sa_to_acl(struct sc_file *file, unsigned int operation, 
@@ -1271,7 +1276,7 @@ static int jcop4_get_key_layout(struct sc_card *card,
 	} else {
 		layout->key_ref_min = 0x41;
 		layout->key_ref_max = 0xFE;
-		layout->pubkey_fid_offset = 0;
+		layout->pubkey_fid_offset = 0x5100;
 	}
 	return SC_SUCCESS;
 }
