@@ -1266,6 +1266,43 @@ static int jcop4_generate_key(struct sc_card *card, struct sc_cardctl_jcop4_genk
 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
 
+/*
+ * The serial number is IC fabrication date, IC serial number and IC
+ * batch identifier of the CPLC data.
+ * GET DATA for the CPLC works while the applet is selected.
+ */
+#define JCOP4_CPLC_LEN 0x2A
+#define JCOP4_CPLC_SERIAL_OFFSET 10
+#define JCOP4_CPLC_SERIAL_LEN 8
+
+static int jcop4_get_serialnr(struct sc_card *card, struct sc_serial_number *serial)
+{
+	struct sc_apdu apdu;
+	u8 rbuf[3 + JCOP4_CPLC_LEN];
+	int r;
+
+	LOG_FUNC_CALLED(card->ctx);
+	if (card->serialnr.len == 0) {
+		sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, 0xCA, 0x9F, 0x7F);
+		apdu.cla = 0x80;
+		apdu.resp = rbuf;
+		apdu.resplen = sizeof rbuf;
+		apdu.le = 0x100;
+		r = sc_transmit_apdu(card, &apdu);
+		LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+		r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+		LOG_TEST_RET(card->ctx, r, "Cannot read CPLC data");
+		if (apdu.resplen != sizeof rbuf || rbuf[0] != 0x9F || rbuf[1] != 0x7F ||
+				rbuf[2] != JCOP4_CPLC_LEN)
+			LOG_TEST_RET(card->ctx, SC_ERROR_INVALID_DATA, "Unexpected CPLC data");
+		memcpy(card->serialnr.value, rbuf + 3 + JCOP4_CPLC_SERIAL_OFFSET,
+				JCOP4_CPLC_SERIAL_LEN);
+		card->serialnr.len = JCOP4_CPLC_SERIAL_LEN;
+	}
+	memcpy(serial, &card->serialnr, sizeof(*serial));
+	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+}
+
 static int jcop4_get_key_layout(struct sc_card *card,
 		struct sc_cardctl_jcop4_key_layout *layout)
 {
@@ -1302,6 +1339,8 @@ static int jcop4_card_ctl(struct sc_card *card, unsigned long cmd, void *ptr)
 	case SC_CARDCTL_JCOP4_GET_KEY_LAYOUT:
 		return jcop4_get_key_layout(card,
 				(struct sc_cardctl_jcop4_key_layout *) ptr);
+	case SC_CARDCTL_GET_SERIALNR:
+		return jcop4_get_serialnr(card, (struct sc_serial_number *) ptr);
 	}
 
 	return SC_ERROR_NOT_SUPPORTED;
