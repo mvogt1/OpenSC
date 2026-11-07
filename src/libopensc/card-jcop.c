@@ -118,12 +118,10 @@ static const struct sc_atr_table jcop_atrs[] = {
 static int jcop_match_card(struct sc_card *card)
 {
     int i;
-    printf("JCOP4 \n");
     i = _sc_match_atr(card, jcop_atrs, &card->type);
     if (i < 0)
        return 0;
     card->name = jcop_atrs[i].name; 
-    printf("JCOP4 OK\n");
     return 1; 
 }
 
@@ -288,7 +286,6 @@ static int jcop_init(struct sc_card *card)
      jcop4_read_pins(card);
      jcop4_read_change_counter(card);
 
-     //exit(0);
      LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
 
@@ -919,8 +916,6 @@ static int jcop4_set_security_env(sc_card_t *card,
 	assert(card != NULL && env != NULL);
 
 	LOG_FUNC_CALLED(ctx);
-	//printf("jcop_set_security_env\n");
-	// exit(1);
      //r=myeid_set_security_env(card,env,se_num);
      //return r;
      drvdata->key_ref=-1;
@@ -929,7 +924,6 @@ static int jcop4_set_security_env(sc_card_t *card,
 			env->operation != SC_SEC_OPERATION_ENCRYPT_SYM &&
 			env->operation != SC_SEC_OPERATION_DECRYPT_SYM) {
           drvdata->key_ref=env->key_ref[0] & 0xFF;
-		//printf("Storing key id:%d 0x%x\n",drvdata->key_ref,drvdata->key_ref);
 	}
 
      if (env->flags & SC_SEC_ENV_ALG_PRESENT) {
@@ -956,34 +950,17 @@ static int jcop4_set_security_env(sc_card_t *card,
      drvdata->algorithm=env->algorithm;
      drvdata->algorithm_flags = env->algorithm_flags;
 
-     if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_SHA1) {
-          printf("SC_ALGORITHM_RSA_HASH_SHA1\n");
-          //tmp.algorithm_ref |= 0x10;
-     }
-          
-     if (env->algorithm_flags & SC_ALGORITHM_RSA_HASH_MD5) {
-          printf("SC_ALGORITHM_RSA_HASH_MD5");
-          //tmp.algorithm_ref |= 0x20;
-     }
-
-
-     if (env->algorithm_flags & SC_ALGORITHM_RSA_PAD_PSS) {
-          printf("SC_ALGORITHM_RSA_PAD_PSS \n");
-     }
-
      if (env->flags & SC_SEC_ENV_ALG_REF_PRESENT)	{
-          //printf("SC_SEC_ENV_ALG_REF_PRESENT: %ld 0x%lx\n",env->algorithm_ref & 0xFF,env->algorithm_ref & 0xFF);
           /*
 		*p++ = 0x80;	// algorithm reference 
 		*p++ = 0x01;
 		*p++ = env->algorithm_ref & 0xFF;
           */
 	}
-     //exit(1);
      if (drvdata->selected == SELECT_MF ||
 			drvdata->selected == SELECT_EFDIR) {
 		drvdata->invalid_senv = 1;
-          printf("invalid_senv !!!!\n");
+          sc_log(card->ctx, "No application DF selected, MSE skipped");
 		return 0;
 	}
      r= jcop4_mse_set(card,env,se_num);
@@ -1015,7 +992,6 @@ static int jcop4_compute_signature(sc_card_t *card,
                    
      
      if (tmp_sbuf_datalen >= 256) {
-          //printf("HHHH\n");
           r=card->ops->decipher(card, data , datalen, out, outlen);
           return r;
      }
@@ -1023,12 +999,9 @@ static int jcop4_compute_signature(sc_card_t *card,
 
 
      
-	//printf("CHECK ME exit\n");
-	 //exit(1);
      //r=card->ops->compute_signature(card, tmp_sbuf, tmp_sbuf_datalen, out, outlen);
      r = iso_ops->compute_signature(card, tmp_sbuf, tmp_sbuf_datalen, out, outlen);
      //r = iso_ops->decipher(card,tmp_sbuf, tmp_sbuf_datalen, out, outlen);
-	 //exit(1);
      return r;
      }
 
@@ -1386,8 +1359,6 @@ jcop_read_record(struct sc_card *card, unsigned int rec_nr, unsigned int idx,
 
 	if (rec_nr > 0xFF)
 		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
-	//printf("JCOP rec_nr:%d idx:%d\n",rec_nr,idx);
-	//	exit(1);
 	if (idx == 0) {
 		/* the applet rejects Le unless it is 00 or the record length */
 		sc_format_apdu(card, &apdu, SC_APDU_CASE_2, 0xB2, rec_nr, 0);
