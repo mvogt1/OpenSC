@@ -9,8 +9,9 @@ cardinfo {
 }
 
 pkcs15 {
-    # EF(TokenInfo) can only be updated with the SO PIN
-    do-last-update      = no;
+    # EF(TokenInfo) can only be updated with the SO PIN, pkcs15-init
+    # asks for it after every change of the card
+    do-last-update      = yes;
 }
 
 PIN user-pin {
