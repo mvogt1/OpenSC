@@ -116,7 +116,7 @@ isoApplet_match_card(sc_card_t *card)
 	{
 		return 0;
 	}
-
+	fprintf(stderr, "isoApplet OK\n");
 	return 1;
 }
 

@@ -84,25 +84,27 @@ static int jcop_finish(struct sc_card *card)
 static const unsigned char jcop_aid[] = {
 		0xA0, 0x00, 0x00, 0x00, 0x63, 0x50, 0x4B, 0x43, 0x53, 0x2D, 0x31, 0x35 };
 
+
 static const struct sc_card_operations *iso_ops = NULL;
 
 static const struct sc_atr_table jcop_atrs[] = {
-       { "3B:E6:00:FF:81:31:FE:45:4A:43:4F:50:33:31:06", NULL, "jcop 2.x", SC_CARD_TYPE_JCOP_GENERIC, 0, NULL },
-       { "3B:F9:96:00:00:80:31:FE:45:53:43:45:37:20:00:00:20:20:27", NULL, "jcop 4.x", SC_CARD_TYPE_JCOP_V4_7, 0, NULL },
-       { NULL, NULL, NULL, 0, 0, NULL }
+     { "3B:F9:96:00:00:80:31:FE:45:53:43:45:37:20:00:00:20:20:27", NULL, "jcop 4.x", SC_CARD_TYPE_JCOP_V4_7, 0, NULL },
+     { NULL, NULL, NULL, 0, 0, NULL }
 };
 
 
 static int jcop_match_card(struct sc_card *card)
 {
-    int i;
-    printf("JCOP4 \n");
-    i = _sc_match_atr(card, jcop_atrs, &card->type);
-    if (i < 0)
-       return 0;
-    card->name = jcop_atrs[i].name; 
-    printf("JCOP4 OK\n");
-    return 1; 
+     int rv,i;
+     rv = iso7816_select_aid(card, jcop_aid, sizeof(jcop_aid), NULL, NULL);
+     if (rv != SC_SUCCESS)
+          return 0;
+     rv = _sc_match_atr(card, jcop_atrs, &card->type);
+     if (rv < 0)
+          return 0;
+     card->name = jcop_atrs[0].name;
+     fprintf(stderr, "JCOP4 OK\n");
+     return 1; 
 }
 
 

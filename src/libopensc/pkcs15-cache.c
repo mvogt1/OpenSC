@@ -82,6 +82,7 @@ static int generate_cache_filename(struct sc_pkcs15_card *p15card,
 	r = sc_get_cache_dir(p15card->card->ctx, dir, sizeof(dir));
 	if (r)
 		return r;
+	fprintf(stderr,"cachedir: %s\n",dir);
 	snprintf(dir + strlen(dir), sizeof(dir) - strlen(dir), "/");
 
 	last_update = sc_pkcs15_get_lastupdate(p15card);
