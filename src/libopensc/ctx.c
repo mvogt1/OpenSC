@@ -102,6 +102,7 @@ struct _sc_driver_entry {
 
 // clang-format off
 static const struct _sc_driver_entry internal_card_drivers[] = {
+	{ "isoApplet",	(void *(*)(void)) sc_get_isoApplet_driver },
 	{ "jcop",       (void *(*)(void)) sc_get_jcop_driver },
 	/* The card handled by skeid shares the ATR with other cards running CardOS 5.4.
 	 * In order to prevent the cardos driver from matching skeid cards, skeid driver
@@ -161,7 +162,6 @@ static const struct _sc_driver_entry internal_card_drivers[] = {
 	{ "chipdoc-it",	(void *(*)(void)) sc_get_chipdocit_driver },
 #endif
 	{ "itacns",	(void *(*)(void)) sc_get_itacns_driver },
-	{ "isoApplet",	(void *(*)(void)) sc_get_isoApplet_driver },
 #ifdef ENABLE_ZLIB
 	{ "gids",	(void *(*)(void)) sc_get_gids_driver },
 #endif
