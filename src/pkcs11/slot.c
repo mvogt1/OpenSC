@@ -219,7 +219,7 @@ card_detect(sc_reader_t *reader, void **reader_states)
 	CK_RV rv;
 	unsigned int i;
 	int j;
-	static int retry = 3;
+	int retry = 3;
 
 	sc_log(context, "%s: Detecting smart card", reader->name);
 	/* Check if someone inserted a card */
@@ -264,7 +264,6 @@ again:
 		 * So better be fussy.*/
 		card_removed(reader);
 		if (!retry--) {
-			retry = 3;
 			return CKR_TOKEN_NOT_PRESENT;
 		}
 		goto again;
