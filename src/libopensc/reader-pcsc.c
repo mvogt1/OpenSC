@@ -86,11 +86,6 @@
  * even though PKCS#11 shows only 64 bytes of them in the slot description. */
 #define PCSC_READER_BUF_SIZE (16 * 128 + 1)
 
-/* Start the PC/SC transaction (SCardBeginTransaction) only when the first
- * command is sent to the card, not already in sc_lock(). Locked sections
- * that are served from caches then cause no PC/SC calls at all. */
-#define PCSC_DEFERRED_LOCK 1
-
 /* Logging */
 #define PCSC_TRACE(reader, desc, rv) do { sc_log(reader->ctx, "%s:" desc ": 0x%08lx\n", reader->name, (unsigned long)((ULONG)rv)); } while (0)
 #define PCSC_LOG(ctx, desc, rv) do { sc_log(ctx, desc ": 0x%08lx\n", (unsigned long)((ULONG)rv)); } while (0)
@@ -133,6 +128,12 @@ struct pcsc_global_private_data {
 	int fixed_pinlength;
 	int enable_pace;
 	int state_proxy;
+	/* Start the PC/SC transaction (SCardBeginTransaction) only when the
+	 * first command is sent to the card, not already in sc_lock(). Locked
+	 * sections that are served from caches then cause no PC/SC calls.
+	 * A reset is then reported by the first command, not by sc_lock(),
+	 * which reopens secure messaging only for resets it sees itself. */
+	int deferred_lock;
 	size_t force_max_recv_size;
 	size_t force_max_send_size;
 	int connect_exclusive;
@@ -795,18 +796,16 @@ pcsc_begin_transaction(sc_reader_t *reader)
 static int
 pcsc_lock(sc_reader_t *reader)
 {
-#if PCSC_DEFERRED_LOCK
 	struct pcsc_private_data *priv = reader->drv_data;
 
+	if (!priv->gpriv->deferred_lock)
+		return pcsc_begin_transaction(reader);
 	if (priv->gpriv->cardmod)
 		return SC_SUCCESS;
 	if (reader->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return SC_ERROR_NOT_ALLOWED;
 	priv->lock_pending = 1;
 	return SC_SUCCESS;
-#else
-	return pcsc_begin_transaction(reader);
-#endif
 }
 
 /* Starts a deferred transaction before a command is sent to the card.
@@ -838,10 +837,8 @@ static int pcsc_unlock(sc_reader_t *reader)
 		return SC_ERROR_NOT_ALLOWED;
 
 	priv->lock_pending = 0;
-#if PCSC_DEFERRED_LOCK
-	if (!priv->locked)
+	if (priv->gpriv->deferred_lock && !priv->locked)
 		return SC_SUCCESS;
-#endif
 
 	rv = priv->gpriv->SCardEndTransaction(priv->pcsc_card, priv->gpriv->transaction_end_action);
 
@@ -974,6 +971,8 @@ static int pcsc_init(sc_context_t *ctx)
 				gpriv->enable_pace);
 		gpriv->state_proxy = scconf_get_bool(conf_block, "state_proxy",
 				gpriv->state_proxy);
+		gpriv->deferred_lock = scconf_get_bool(conf_block, "deferred_lock",
+				gpriv->deferred_lock);
 		gpriv->force_max_send_size = scconf_get_int(conf_block,
 				"max_send_size", (int)gpriv->force_max_send_size);
 		gpriv->force_max_recv_size = scconf_get_int(conf_block,
@@ -991,12 +990,13 @@ static int pcsc_init(sc_context_t *ctx)
 	}
 	sc_log(ctx,
 			"PC/SC options: connect_exclusive=%d disconnect_action=%u transaction_end_action=%u"
-			" reconnect_action=%u enable_pinpad=%d enable_pace=%d",
+			" reconnect_action=%u enable_pinpad=%d enable_pace=%d"
+			" state_proxy=%d deferred_lock=%d",
 			gpriv->connect_exclusive,
 			(unsigned int)gpriv->disconnect_action,
 			(unsigned int)gpriv->transaction_end_action,
 			(unsigned int)gpriv->reconnect_action, gpriv->enable_pinpad,
-			gpriv->enable_pace);
+			gpriv->enable_pace, gpriv->state_proxy, gpriv->deferred_lock);
 
 	gpriv->dlhandle = sc_dlopen(gpriv->provider_library);
 	if (gpriv->dlhandle == NULL) {

@@ -659,6 +659,26 @@ app <replaceable>application</replaceable> {
 					</varlistentry>
 					<varlistentry>
 						<term>
+							<option>deferred_lock = <replaceable>bool</replaceable>;</option>
+						</term>
+						<listitem><para>
+								Start the PC/SC transaction
+								(SCardBeginTransaction()) only when
+								the first command is sent to the
+								card, not already when OpenSC locks
+								the card. Operations answered from
+								caches then cause no PC/SC calls. A
+								card reset is then noticed at the
+								first command instead of at the
+								lock, and the secure messaging
+								session is not opened again after
+								such a reset. Do not use it with
+								cards that need secure messaging
+								(Default: <literal>false</literal>).
+						</para></listitem>
+					</varlistentry>
+					<varlistentry>
+						<term>
 							<option>enable_pinpad = <replaceable>bool</replaceable>;</option>
 						</term>
 						<listitem><para>

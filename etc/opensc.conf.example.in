@@ -96,6 +96,15 @@ app default {
 		# Default: false
 		# state_proxy = true;
 		#
+		# Start the PC/SC transaction only when the first command is sent
+		# to the card, not already when OpenSC locks the card. Operations
+		# answered from caches then cause no PC/SC calls. A card reset is
+		# then noticed at the first command instead of at the lock, and
+		# the secure messaging session is not opened again after such a
+		# reset. Do not use it with cards that need secure messaging.
+		# Default: false
+		# deferred_lock = true;
+		#
 		# Enable pinpad if detected (PC/SC v2.0.2 Part 10)
 		# Default: true
 		# enable_pinpad = false;
