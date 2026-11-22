@@ -51,6 +51,9 @@
  * since then.  A card reset by another application changes no reader
  * state, it is noticed by the next call on the card (SCARD_W_RESET_CARD).
  *
+ * SCardListReaders() is answered from the list of readers the thread
+ * watches, it is renewed on every PnP notification.
+ *
  * Every call the copy cannot answer goes to PC/SC.
  */
 
@@ -93,12 +96,17 @@ struct pcsc_proxy_monitor {
 	size_t count;
 	struct monitor_entry entry[MONITOR_MAX_READERS];
 	DWORD pnp_state;
+	/* entry[] lists all readers of PC/SC, the result of its SCardListReaders */
+	int list_complete;
+	LONG list_rv;
 	/* counts the changes the thread has seen */
 	unsigned long generation;
 	struct monitor_card card[MONITOR_MAX_CARDS];
 
 	/* used by the thread only */
 	size_t nwatch;	/* readers in watch[], without PnP */
+	int watch_complete;	/* watch[] has all readers */
+	LONG watch_list_rv;
 	char watch_name[MONITOR_MAX_READERS][MONITOR_NAME_LEN];
 	SCARD_READERSTATE watch[MONITOR_MAX_READERS + 1];
 };
@@ -124,13 +132,20 @@ static void monitor_list_readers(struct pcsc_proxy_monitor *mon)
 			mon->watch[mon->nwatch].dwCurrentState : SCARD_STATE_UNAWARE;
 
 	rv = mon->proxy->SCardListReaders(mon->mon_ctx, NULL, buf, &len);
+	mon->watch_list_rv = rv;
+	mon->watch_complete = rv == SCARD_S_SUCCESS;
+#ifdef SCARD_E_NO_READERS_AVAILABLE
+	if (rv == (LONG)SCARD_E_NO_READERS_AVAILABLE)
+		mon->watch_complete = 1;
+#endif
 	if (rv != SCARD_S_SUCCESS)
 		len = 0;	/* no readers (yet) */
 
-	for (p = buf; len > 1 && p < buf + len && *p != '\0'
-			&& n < MONITOR_MAX_READERS; p += strlen(p) + 1) {
-		if (strlen(p) >= MONITOR_NAME_LEN)
+	for (p = buf; len > 1 && p < buf + len && *p != '\0'; p += strlen(p) + 1) {
+		if (strlen(p) >= MONITOR_NAME_LEN || n == MONITOR_MAX_READERS) {
+			mon->watch_complete = 0;	/* not watched */
 			continue;
+		}
 		strcpy(mon->watch_name[n], p);
 		/* unaware: the next wait returns at once with the current state */
 		mon->watch[n].szReader = mon->watch_name[n];
@@ -216,6 +231,8 @@ static void *monitor_thread(void *arg)
 			memcpy(e->rgbAtr, rs->rgbAtr, e->cbAtr);
 		}
 		mon->pnp_state = mon->watch[mon->nwatch].dwCurrentState;
+		mon->list_complete = mon->watch_complete;
+		mon->list_rv = mon->watch_list_rv;
 		if (changed || rebuild)
 			mon->generation++;
 		mon->valid = !rebuild;
@@ -363,6 +380,45 @@ static void monitor_status_keep(struct pcsc_proxy_monitor *mon, SCARDHANDLE hCar
 	pthread_mutex_unlock(&mon->lock);
 }
 
+/* answer SCardListReaders() from the watched readers, 0 if it cannot be used */
+static int monitor_list_answer(struct pcsc_proxy_monitor *mon,
+		LPSTR mszReaders, LPDWORD pcchReaders, LONG *rv)
+{
+	int answered = 0;
+	DWORD len = 1;	/* the final '\0' */
+	size_t i;
+
+	pthread_mutex_lock(&mon->lock);
+	if (mon->valid && mon->list_complete) {
+		answered = 1;
+		for (i = 0; i < mon->count; i++)
+			len += (DWORD)strlen(mon->entry[i].name) + 1;
+		if (mon->list_rv != SCARD_S_SUCCESS) {
+			*rv = mon->list_rv;	/* no readers */
+		} else if (mszReaders == NULL) {
+			*pcchReaders = len;
+			*rv = SCARD_S_SUCCESS;
+		} else if (*pcchReaders < len) {
+			*pcchReaders = len;
+			*rv = SCARD_E_INSUFFICIENT_BUFFER;
+		} else {
+			char *p = mszReaders;
+
+			for (i = 0; i < mon->count; i++) {
+				size_t n = strlen(mon->entry[i].name) + 1;
+
+				memcpy(p, mon->entry[i].name, n);
+				p += n;
+			}
+			*p = '\0';
+			*pcchReaders = len;
+			*rv = SCARD_S_SUCCESS;
+		}
+	}
+	pthread_mutex_unlock(&mon->lock);
+	return answered;
+}
+
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 {
 	struct pcsc_proxy_monitor *mon;
@@ -448,11 +504,13 @@ int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 #endif /* HAVE_PCSC_PROXY_MONITOR */
 
 void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
-		SCardGetStatusChange_t get_status_change, SCardStatus_t status)
+		SCardGetStatusChange_t get_status_change, SCardStatus_t status,
+		SCardListReaders_t list_readers)
 {
 	proxy->ctx = ctx;
 	proxy->SCardGetStatusChange = get_status_change;
 	proxy->SCardStatus = status;
+	proxy->SCardListReaders = list_readers;
 	proxy->monitor = NULL;
 }
 
@@ -544,6 +602,28 @@ LONG pcsc_proxy_SCardStatus(struct pcsc_proxy *proxy, SCARDHANDLE hCard,
 	return proxy->SCardStatus(hCard, mszReaderNames, pcchReaderLen, pdwState,
 			pdwProtocol, pbAtr, pcbAtrLen);
 #endif
+}
+
+LONG pcsc_proxy_SCardListReaders(struct pcsc_proxy *proxy, SCARDCONTEXT hContext,
+		LPCSTR mszGroups, LPSTR mszReaders, LPDWORD pcchReaders)
+{
+#ifdef HAVE_PCSC_PROXY_MONITOR
+	struct pcsc_proxy_monitor *mon = proxy->monitor;
+	LONG rv;
+
+	/* all groups, no buffer allocated by PC/SC */
+	if (mon != NULL && mon->pid == getpid() && mszGroups == NULL
+			&& pcchReaders != NULL
+#ifdef SCARD_AUTOALLOCATE
+			&& !(mszReaders != NULL && *pcchReaders == SCARD_AUTOALLOCATE)
+#endif
+			&& monitor_list_answer(mon, mszReaders, pcchReaders, &rv)) {
+		sc_log(proxy->ctx, "pcsc proxy: SCardListReaders answered: 0x%08lx",
+				(unsigned long)rv);
+		return rv;
+	}
+#endif
+	return proxy->SCardListReaders(hContext, mszGroups, mszReaders, pcchReaders);
 }
 
 #endif   /* ENABLE_PCSC */

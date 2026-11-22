@@ -151,7 +151,8 @@ struct pcsc_global_private_data {
 	SCardTransmit_t SCardTransmit;
 	SCardListReaders_t SCardListReaders;
 	SCardGetAttrib_t SCardGetAttrib;
-	/* SCardGetStatusChange and SCardStatus are called through the proxy */
+	/* SCardGetStatusChange, SCardStatus and SCardListReaders are called
+	 * through the proxy */
 	struct pcsc_proxy proxy;
 
 	sc_reader_t *attached_reader;
@@ -1006,11 +1007,11 @@ static int pcsc_init(sc_context_t *ctx)
 		goto out;
 	}
 
-	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus);
+	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus,
+			gpriv->SCardListReaders);
 	if (gpriv->state_proxy) {
 		gpriv->proxy.SCardEstablishContext = gpriv->SCardEstablishContext;
 		gpriv->proxy.SCardReleaseContext = gpriv->SCardReleaseContext;
-		gpriv->proxy.SCardListReaders = gpriv->SCardListReaders;
 		gpriv->proxy.SCardCancel = gpriv->SCardCancel;
 		if (gpriv->cardmod)
 			sc_log(ctx, "state_proxy not used with cardmod");
@@ -1494,12 +1495,12 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 			 * small, one extra cycle of two calls (size query and fetch
 			 * into a grown buffer) is needed. */
 			reader_buf_size = reader_buf_cap;
-			rv = gpriv->SCardListReaders(gpriv->pcsc_ctx, mszGroups,
+			rv = pcsc_proxy_SCardListReaders(&gpriv->proxy, gpriv->pcsc_ctx, mszGroups,
 					reader_buf, (LPDWORD)&reader_buf_size);
 			if (rv == (LONG)SCARD_E_INSUFFICIENT_BUFFER) {
 				/* The required size is only specified for a NULL buffer, so
 				 * query it explicitly, then grow the buffer and try again. */
-				rv = gpriv->SCardListReaders(gpriv->pcsc_ctx, mszGroups,
+				rv = pcsc_proxy_SCardListReaders(&gpriv->proxy, gpriv->pcsc_ctx, mszGroups,
 						NULL, (LPDWORD)&reader_buf_size);
 				if (rv == SCARD_S_SUCCESS && reader_buf_size > reader_buf_cap) {
 					free(reader_buf);
