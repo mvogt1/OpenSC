@@ -34,6 +34,7 @@
 
 #ifdef HAVE_PCSC_PROXY_MONITOR
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -45,6 +46,8 @@
  * The monitor thread waits in SCardGetStatusChange(INFINITE) on its own
  * context for changes of all readers and keeps a copy of their states.
  * A poll (timeout 0) is answered from this copy like PC/SC would do it.
+ * A blocking call waits locally until the thread sees a change or the
+ * timeout ends, SCardCancel() wakes up the local waits of its context.
  *
  * SCardStatus() goes to PC/SC once per card handle, its result is kept and
  * returned again as long as the monitor has seen no change of any reader
@@ -82,6 +85,13 @@ struct monitor_card {
 	unsigned char rgbAtr[MAX_ATR_SIZE];
 };
 
+/* a SCardGetStatusChange() waiting for the thread */
+struct monitor_waiter {
+	SCARDCONTEXT hContext;
+	int cancelled;
+	struct monitor_waiter *next;
+};
+
 struct pcsc_proxy_monitor {
 	struct pcsc_proxy *proxy;
 	SCARDCONTEXT mon_ctx;
@@ -90,6 +100,9 @@ struct pcsc_proxy_monitor {
 
 	/* protected by lock */
 	pthread_mutex_t lock;
+	pthread_cond_t changed;	/* the thread published a new copy or stopped */
+	struct monitor_waiter *waiters;
+	int real_waits;	/* blocking calls that went to PC/SC */
 	int valid;	/* the copy is the current PC/SC state */
 	int stop;
 	int exited;
@@ -236,6 +249,7 @@ static void *monitor_thread(void *arg)
 		if (changed || rebuild)
 			mon->generation++;
 		mon->valid = !rebuild;
+		pthread_cond_broadcast(&mon->changed);
 		pthread_mutex_unlock(&mon->lock);
 
 		if (rebuild)
@@ -251,24 +265,26 @@ static void *monitor_thread(void *arg)
 	pthread_mutex_lock(&mon->lock);
 	mon->valid = 0;
 	mon->exited = 1;
+	pthread_cond_broadcast(&mon->changed);
 	pthread_mutex_unlock(&mon->lock);
 	sc_log(mon->proxy->ctx, "pcsc proxy: monitor stopped");
 	return NULL;
 }
 
-/* answer a poll from the copy, 0 if the copy cannot answer it */
-static int monitor_answer(struct pcsc_proxy_monitor *mon,
+#define ANSWER_NO	0	/* the copy cannot answer the call */
+#define ANSWER_YES	1
+#define ANSWER_LATER	2	/* the thread renews the copy, ask again */
+
+/* answer a call from the copy like a poll, called with the lock held */
+static int monitor_answer_locked(struct pcsc_proxy_monitor *mon,
 		SCARD_READERSTATE *rgReaderStates, DWORD cReaders, LONG *rv)
 {
 	int answered = 1, changed = 0;
 	DWORD i;
 	size_t j;
 
-	if (mon->pid != getpid())
-		return 0;	/* forked child, the thread belongs to the parent */
-
-	pthread_mutex_lock(&mon->lock);
-	answered = mon->valid;
+	if (!mon->valid)
+		return mon->exited ? ANSWER_NO : ANSWER_LATER;
 	/* check all readers first, the caller's states are only changed
 	 * if the whole call is answered */
 	for (i = 0; answered && i < cReaders; i++) {
@@ -308,11 +324,98 @@ static int monitor_answer(struct pcsc_proxy_monitor *mon,
 		rs->cbAtr = mon->entry[j].cbAtr;
 		memcpy(rs->rgbAtr, mon->entry[j].rgbAtr, rs->cbAtr);
 	}
+
+	if (!answered)
+		return ANSWER_NO;
+	*rv = changed ? SCARD_S_SUCCESS : (LONG)SCARD_E_TIMEOUT;
+	return ANSWER_YES;
+}
+
+/* answer a poll from the copy, 0 if the copy cannot answer it */
+static int monitor_answer(struct pcsc_proxy_monitor *mon,
+		SCARD_READERSTATE *rgReaderStates, DWORD cReaders, LONG *rv)
+{
+	int answered;
+
+	pthread_mutex_lock(&mon->lock);
+	answered = monitor_answer_locked(mon, rgReaderStates, cReaders, rv);
+	pthread_mutex_unlock(&mon->lock);
+	return answered == ANSWER_YES;
+}
+
+/* a blocking call: wait until the copy shows a change, the timeout ends or
+ * SCardCancel() is called for hContext.  0 if the copy cannot answer it,
+ * *remaining is then the time left for PC/SC. */
+static int monitor_wait(struct pcsc_proxy_monitor *mon, SCARDCONTEXT hContext,
+		DWORD dwTimeout, SCARD_READERSTATE *rgReaderStates, DWORD cReaders,
+		LONG *rv, DWORD *remaining)
+{
+	struct monitor_waiter w, **pw;
+	struct timespec deadline;
+	int answered, timed_out = 0;
+
+	if (dwTimeout != INFINITE) {
+		clock_gettime(CLOCK_MONOTONIC, &deadline);
+		deadline.tv_sec += dwTimeout / 1000;
+		deadline.tv_nsec += (long)(dwTimeout % 1000) * 1000 * 1000;
+		if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000 * 1000 * 1000;
+		}
+	}
+
+	w.hContext = hContext;
+	w.cancelled = 0;
+	pthread_mutex_lock(&mon->lock);
+	w.next = mon->waiters;
+	mon->waiters = &w;
+	for (;;) {
+		if (w.cancelled || mon->stop) {
+			*rv = SCARD_E_CANCELLED;
+			answered = ANSWER_YES;
+			break;
+		}
+		answered = monitor_answer_locked(mon, rgReaderStates, cReaders, rv);
+		if (answered == ANSWER_NO)
+			break;
+		if (timed_out) {
+			if (answered == ANSWER_LATER)
+				answered = ANSWER_NO;	/* PC/SC answers the poll */
+			break;
+		}
+		if (answered == ANSWER_YES && *rv != (LONG)SCARD_E_TIMEOUT)
+			break;	/* changed */
+		if (dwTimeout == INFINITE)
+			pthread_cond_wait(&mon->changed, &mon->lock);
+		else if (pthread_cond_timedwait(&mon->changed, &mon->lock, &deadline) == ETIMEDOUT)
+			timed_out = 1;
+	}
+	for (pw = &mon->waiters; *pw != NULL; pw = &(*pw)->next) {
+		if (*pw == &w) {
+			*pw = w.next;
+			break;
+		}
+	}
+	if (answered == ANSWER_NO)
+		mon->real_waits++;	/* the caller goes to PC/SC now */
+	pthread_cond_broadcast(&mon->changed);	/* monitor_stop() waits for us */
 	pthread_mutex_unlock(&mon->lock);
 
-	if (answered)
-		*rv = changed ? SCARD_S_SUCCESS : (LONG)SCARD_E_TIMEOUT;
-	return answered;
+	*remaining = 0;
+	if (answered == ANSWER_NO && !timed_out) {
+		if (dwTimeout == INFINITE) {
+			*remaining = INFINITE;
+		} else {
+			struct timespec now;
+			long long ms;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			ms = (long long)(deadline.tv_sec - now.tv_sec) * 1000
+				+ (deadline.tv_nsec - now.tv_nsec) / (1000 * 1000);
+			*remaining = ms > 0 ? (DWORD)ms : 0;
+		}
+	}
+	return answered == ANSWER_YES;
 }
 
 static struct monitor_card *monitor_card_find(struct pcsc_proxy_monitor *mon, SCARDHANDLE hCard)
@@ -433,6 +536,21 @@ int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 		free(mon);
 		return SC_ERROR_INTERNAL;
 	}
+	{
+		pthread_condattr_t attr;
+		int r = pthread_condattr_init(&attr);
+
+		if (r == 0)
+			r = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+		if (r == 0)
+			r = pthread_cond_init(&mon->changed, &attr);
+		pthread_condattr_destroy(&attr);
+		if (r != 0) {
+			pthread_mutex_destroy(&mon->lock);
+			free(mon);
+			return SC_ERROR_INTERNAL;
+		}
+	}
 
 	rv = proxy->SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &mon->mon_ctx);
 	if (rv != SCARD_S_SUCCESS) {
@@ -450,6 +568,7 @@ int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 	return SC_SUCCESS;
 
 err:
+	pthread_cond_destroy(&mon->changed);
 	pthread_mutex_destroy(&mon->lock);
 	free(mon);
 	return SC_ERROR_INTERNAL;
@@ -458,7 +577,7 @@ err:
 static void monitor_stop(struct pcsc_proxy *proxy)
 {
 	struct pcsc_proxy_monitor *mon = proxy->monitor;
-	int exited = 0, i;
+	int exited = 0, idle = 0, i;
 
 	proxy->monitor = NULL;
 
@@ -467,28 +586,43 @@ static void monitor_stop(struct pcsc_proxy *proxy)
 	if (mon->pid != getpid() || proxy->ctx->flags & SC_CTX_FLAG_TERMINATE)
 		return;
 
+	/* local waits return SCARD_E_CANCELLED */
 	pthread_mutex_lock(&mon->lock);
 	mon->stop = 1;
+	pthread_cond_broadcast(&mon->changed);
 	pthread_mutex_unlock(&mon->lock);
 
 	/* SCardCancel only stops a running wait, so repeat it until the
-	 * thread has noticed the stop flag */
+	 * thread has noticed the stop flag; the callers must have left the
+	 * proxy before mon is freed */
 	for (i = 0; i < 200 && !exited; i++) {
-		proxy->SCardCancel(mon->mon_ctx);
 		pthread_mutex_lock(&mon->lock);
 		exited = mon->exited;
 		pthread_mutex_unlock(&mon->lock);
-		if (!exited)
+		if (!exited) {
+			proxy->SCardCancel(mon->mon_ctx);
+			monitor_sleep_ms(10);
+		}
+	}
+	for (; i < 200 && !idle; i++) {
+		pthread_mutex_lock(&mon->lock);
+		idle = mon->waiters == NULL && mon->real_waits == 0;
+		pthread_mutex_unlock(&mon->lock);
+		if (!idle)
 			monitor_sleep_ms(10);
 	}
-	if (!exited) {
+	if (!exited || !idle) {
 		/* do not hang the application, leave the thread behind */
 		sc_log(proxy->ctx, "pcsc proxy: monitor does not stop");
-		pthread_detach(mon->thread);
+		if (exited)
+			pthread_join(mon->thread, NULL);
+		else
+			pthread_detach(mon->thread);
 		return;
 	}
 	pthread_join(mon->thread, NULL);
 	proxy->SCardReleaseContext(mon->mon_ctx);
+	pthread_cond_destroy(&mon->changed);
 	pthread_mutex_destroy(&mon->lock);
 	free(mon);
 }
@@ -505,12 +639,13 @@ int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 
 void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
 		SCardGetStatusChange_t get_status_change, SCardStatus_t status,
-		SCardListReaders_t list_readers)
+		SCardListReaders_t list_readers, SCardCancel_t cancel)
 {
 	proxy->ctx = ctx;
 	proxy->SCardGetStatusChange = get_status_change;
 	proxy->SCardStatus = status;
 	proxy->SCardListReaders = list_readers;
+	proxy->SCardCancel = cancel;
 	proxy->monitor = NULL;
 }
 
@@ -526,16 +661,38 @@ LONG pcsc_proxy_SCardGetStatusChange(struct pcsc_proxy *proxy, SCARDCONTEXT hCon
 		DWORD dwTimeout, SCARD_READERSTATE *rgReaderStates, DWORD cReaders)
 {
 #ifdef HAVE_PCSC_PROXY_MONITOR
+	struct pcsc_proxy_monitor *mon = proxy->monitor;
+	DWORD remaining;
 	LONG rv;
 
-	if (dwTimeout == 0 && proxy->monitor
-			&& monitor_answer(proxy->monitor, rgReaderStates, cReaders, &rv)) {
-		sc_log(proxy->ctx, "pcsc proxy: SCardGetStatusChange answered: 0x%08lx",
+	/* in a forked child the thread belongs to the parent */
+	if (mon == NULL || mon->pid != getpid())
+		return proxy->SCardGetStatusChange(hContext, dwTimeout, rgReaderStates, cReaders);
+
+	if (dwTimeout == 0) {
+		if (monitor_answer(mon, rgReaderStates, cReaders, &rv)) {
+			sc_log(proxy->ctx, "pcsc proxy: SCardGetStatusChange answered: 0x%08lx",
+					(unsigned long)rv);
+			return rv;
+		}
+		return proxy->SCardGetStatusChange(hContext, 0, rgReaderStates, cReaders);
+	}
+
+	if (monitor_wait(mon, hContext, dwTimeout, rgReaderStates, cReaders, &rv, &remaining)) {
+		sc_log(proxy->ctx, "pcsc proxy: SCardGetStatusChange waited: 0x%08lx",
 				(unsigned long)rv);
 		return rv;
 	}
-#endif
+	/* counted in real_waits by monitor_wait(), SCardCancel() goes to PC/SC */
+	rv = proxy->SCardGetStatusChange(hContext, remaining, rgReaderStates, cReaders);
+	pthread_mutex_lock(&mon->lock);
+	mon->real_waits--;
+	pthread_cond_broadcast(&mon->changed);
+	pthread_mutex_unlock(&mon->lock);
+	return rv;
+#else
 	return proxy->SCardGetStatusChange(hContext, dwTimeout, rgReaderStates, cReaders);
+#endif
 }
 
 void pcsc_proxy_card_forget(struct pcsc_proxy *proxy, SCARDHANDLE hCard)
@@ -624,6 +781,33 @@ LONG pcsc_proxy_SCardListReaders(struct pcsc_proxy *proxy, SCARDCONTEXT hContext
 	}
 #endif
 	return proxy->SCardListReaders(hContext, mszGroups, mszReaders, pcchReaders);
+}
+
+LONG pcsc_proxy_SCardCancel(struct pcsc_proxy *proxy, SCARDCONTEXT hContext)
+{
+#ifdef HAVE_PCSC_PROXY_MONITOR
+	struct pcsc_proxy_monitor *mon = proxy->monitor;
+	struct monitor_waiter *w;
+	int real_waits;
+
+	if (mon == NULL || mon->pid != getpid())
+		return proxy->SCardCancel(hContext);
+
+	pthread_mutex_lock(&mon->lock);
+	for (w = mon->waiters; w != NULL; w = w->next)
+		if (w->hContext == hContext)
+			w->cancelled = 1;
+	pthread_cond_broadcast(&mon->changed);
+	real_waits = mon->real_waits;
+	pthread_mutex_unlock(&mon->lock);
+
+	/* a blocking call the copy could not answer waits in PC/SC */
+	if (real_waits == 0) {
+		sc_log(proxy->ctx, "pcsc proxy: SCardCancel answered");
+		return SCARD_S_SUCCESS;
+	}
+#endif
+	return proxy->SCardCancel(hContext);
 }
 
 #endif   /* ENABLE_PCSC */

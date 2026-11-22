@@ -25,8 +25,8 @@
 #include "internal-winscard.h"
 
 /*
- * reader-pcsc.c calls SCardGetStatusChange(), SCardStatus() and
- * SCardListReaders() through
+ * reader-pcsc.c calls SCardGetStatusChange(), SCardStatus(),
+ * SCardListReaders() and SCardCancel() through
  * this proxy.  The proxy may answer a call itself instead of asking PC/SC.
  */
 struct pcsc_proxy_monitor;
@@ -38,10 +38,10 @@ struct pcsc_proxy {
 	SCardGetStatusChange_t SCardGetStatusChange;
 	SCardStatus_t SCardStatus;
 	SCardListReaders_t SCardListReaders;
+	SCardCancel_t SCardCancel;
 	/* used by the monitor thread */
 	SCardEstablishContext_t SCardEstablishContext;
 	SCardReleaseContext_t SCardReleaseContext;
-	SCardCancel_t SCardCancel;
 
 	/* NULL: every call goes to PC/SC */
 	struct pcsc_proxy_monitor *monitor;
@@ -49,10 +49,10 @@ struct pcsc_proxy {
 
 void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
 		SCardGetStatusChange_t get_status_change, SCardStatus_t status,
-		SCardListReaders_t list_readers);
-/* start the thread that answers SCardGetStatusChange() polls and repeated
- * SCardStatus() calls, needs the SCardEstablishContext,
- * SCardReleaseContext and SCardCancel members to be set */
+		SCardListReaders_t list_readers, SCardCancel_t cancel);
+/* start the thread that answers SCardGetStatusChange(), repeated
+ * SCardStatus() and SCardListReaders() calls, needs the
+ * SCardEstablishContext and SCardReleaseContext members to be set */
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy);
 void pcsc_proxy_finish(struct pcsc_proxy *proxy);
 /* the card handle was disconnected, reconnected or a call on it failed:
@@ -64,6 +64,7 @@ LONG pcsc_proxy_SCardGetStatusChange(struct pcsc_proxy *proxy, SCARDCONTEXT hCon
 LONG pcsc_proxy_SCardStatus(struct pcsc_proxy *proxy, SCARDHANDLE hCard,
 		LPSTR mszReaderNames, LPDWORD pcchReaderLen, LPDWORD pdwState,
 		LPDWORD pdwProtocol, LPBYTE pbAtr, LPDWORD pcbAtrLen);
+LONG pcsc_proxy_SCardCancel(struct pcsc_proxy *proxy, SCARDCONTEXT hContext);
 LONG pcsc_proxy_SCardListReaders(struct pcsc_proxy *proxy, SCARDCONTEXT hContext,
 		LPCSTR mszGroups, LPSTR mszReaders, LPDWORD pcchReaders);
 

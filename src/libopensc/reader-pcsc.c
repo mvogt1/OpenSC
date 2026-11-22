@@ -151,8 +151,8 @@ struct pcsc_global_private_data {
 	SCardTransmit_t SCardTransmit;
 	SCardListReaders_t SCardListReaders;
 	SCardGetAttrib_t SCardGetAttrib;
-	/* SCardGetStatusChange, SCardStatus and SCardListReaders are called
-	 * through the proxy */
+	/* SCardGetStatusChange, SCardStatus, SCardListReaders and SCardCancel
+	 * are called through the proxy */
 	struct pcsc_proxy proxy;
 
 	sc_reader_t *attached_reader;
@@ -844,7 +844,7 @@ static int pcsc_cancel(sc_context_t *ctx)
 
 	for (i = 0; i < ARRAY_SIZE(gpriv->pcsc_wait_ctx); i++) {
 		if (gpriv->pcsc_wait_ctx[i] != (SCARDCONTEXT)-1) {
-			rv = gpriv->SCardCancel(gpriv->pcsc_wait_ctx[i]);
+			rv = pcsc_proxy_SCardCancel(&gpriv->proxy, gpriv->pcsc_wait_ctx[i]);
 			if (rv == SCARD_S_SUCCESS) {
 				/* Also close and clear the waiting context */
 				rv = gpriv->SCardReleaseContext(gpriv->pcsc_wait_ctx[i]);
@@ -1008,11 +1008,10 @@ static int pcsc_init(sc_context_t *ctx)
 	}
 
 	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus,
-			gpriv->SCardListReaders);
+			gpriv->SCardListReaders, gpriv->SCardCancel);
 	if (gpriv->state_proxy) {
 		gpriv->proxy.SCardEstablishContext = gpriv->SCardEstablishContext;
 		gpriv->proxy.SCardReleaseContext = gpriv->SCardReleaseContext;
-		gpriv->proxy.SCardCancel = gpriv->SCardCancel;
 		if (gpriv->cardmod)
 			sc_log(ctx, "state_proxy not used with cardmod");
 		else if (ctx->flags & SC_CTX_FLAG_NO_THREADS)
