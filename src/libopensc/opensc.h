@@ -860,6 +860,8 @@ typedef struct {
 #define SC_CTX_FLAG_ENABLE_DEFAULT_DRIVER	0x00000008
 #define SC_CTX_FLAG_DISABLE_POPUPS			0x00000010
 #define SC_CTX_FLAG_DISABLE_COLORS			0x00000020
+/** the application does not allow libopensc to create threads */
+#define SC_CTX_FLAG_NO_THREADS				0x00000040
 
 typedef struct ossl3ctx ossl3ctx_t;
 

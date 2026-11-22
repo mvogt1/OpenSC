@@ -346,6 +346,9 @@ CK_RV C_Initialize(CK_VOID_PTR pInitArgs)
 	ctx_opts.ver        = 0;
 	ctx_opts.app_name   = MODULE_APP_NAME;
 	ctx_opts.thread_ctx = &sc_thread_ctx;
+	if (pInitArgs != NULL_PTR
+			&& (((CK_C_INITIALIZE_ARGS_PTR)pInitArgs)->flags & CKF_LIBRARY_CANT_CREATE_OS_THREADS))
+		ctx_opts.flags |= SC_CTX_FLAG_NO_THREADS;
 
 	rc = sc_context_create(&context, &ctx_opts);
 	if (rc != SC_SUCCESS) {

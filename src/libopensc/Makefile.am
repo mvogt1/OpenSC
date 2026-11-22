@@ -21,7 +21,7 @@ AM_CPPFLAGS = -D'OPENSC_CONF_PATH="$(sysconfdir)/opensc.conf"' \
      -D'DEFAULT_SM_MODULE="$(DEFAULT_SM_MODULE)"' \
 	-I$(top_srcdir)/src
 AM_CFLAGS = $(OPENPACE_CFLAGS) $(OPTIONAL_OPENSSL_CFLAGS) $(OPTIONAL_OPENCT_CFLAGS) \
-	$(OPTIONAL_PCSC_CFLAGS) $(OPTIONAL_ZLIB_CFLAGS)
+	$(OPTIONAL_PCSC_CFLAGS) $(OPTIONAL_ZLIB_CFLAGS) $(PTHREAD_CFLAGS)
 AM_OBJCFLAGS = $(AM_CFLAGS)
 
 libopensc_la_SOURCES_BASE = \
@@ -84,7 +84,7 @@ libopensc_la_LIBADD = $(OPENPACE_LIBS) $(OPTIONAL_OPENSSL_LIBS) \
 	$(top_builddir)/src/common/libscdl.la \
 	$(top_builddir)/src/ui/libnotify.la \
 	$(top_builddir)/src/ui/libstrings.la \
-	$(top_builddir)/src/sm/libsmeac.la
+	$(top_builddir)/src/sm/libsmeac.la $(PTHREAD_LIBS)
 if WIN32
 libopensc_la_LIBADD += -lws2_32 -lshlwapi
 endif

@@ -644,6 +644,21 @@ app <replaceable>application</replaceable> {
 					</varlistentry>
 					<varlistentry>
 						<term>
+							<option>state_proxy = <replaceable>bool</replaceable>;</option>
+						</term>
+						<listitem><para>
+								Answer card presence checks
+								(SCardGetStatusChange() polls) from a
+								background SCardGetStatusChange()
+								instead of asking PC/SC every time.
+								This saves round trips to a remote
+								pcscd. OpenSC starts an own thread for
+								it, not available on Windows and macOS
+								(Default: <literal>false</literal>).
+						</para></listitem>
+					</varlistentry>
+					<varlistentry>
+						<term>
 							<option>enable_pinpad = <replaceable>bool</replaceable>;</option>
 						</term>
 						<listitem><para>

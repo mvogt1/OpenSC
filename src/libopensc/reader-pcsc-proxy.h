@@ -28,16 +28,30 @@
  * reader-pcsc.c calls SCardGetStatusChange() and SCardStatus() through
  * this proxy.  The proxy may answer a call itself instead of asking PC/SC.
  */
+struct pcsc_proxy_monitor;
+
 struct pcsc_proxy {
 	sc_context_t *ctx;
 
 	/* the real PC/SC functions */
 	SCardGetStatusChange_t SCardGetStatusChange;
 	SCardStatus_t SCardStatus;
+	/* used by the monitor thread */
+	SCardEstablishContext_t SCardEstablishContext;
+	SCardReleaseContext_t SCardReleaseContext;
+	SCardListReaders_t SCardListReaders;
+	SCardCancel_t SCardCancel;
+
+	/* NULL: every call goes to PC/SC */
+	struct pcsc_proxy_monitor *monitor;
 };
 
 void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
 		SCardGetStatusChange_t get_status_change, SCardStatus_t status);
+/* start the thread that answers SCardGetStatusChange() polls, needs the
+ * SCardEstablishContext, SCardReleaseContext, SCardListReaders and
+ * SCardCancel members to be set */
+int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy);
 void pcsc_proxy_finish(struct pcsc_proxy *proxy);
 
 LONG pcsc_proxy_SCardGetStatusChange(struct pcsc_proxy *proxy, SCARDCONTEXT hContext,

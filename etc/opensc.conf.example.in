@@ -89,6 +89,13 @@ app default {
 		# Default: leave
 		# reconnect_action = reset;
 		#
+		# Answer card presence checks (SCardGetStatusChange polls) from
+		# a background SCardGetStatusChange() in an own thread instead of
+		# asking PC/SC every time. This saves round trips to a remote
+		# pcscd. Not available on Windows and macOS.
+		# Default: false
+		# state_proxy = true;
+		#
 		# Enable pinpad if detected (PC/SC v2.0.2 Part 10)
 		# Default: true
 		# enable_pinpad = false;

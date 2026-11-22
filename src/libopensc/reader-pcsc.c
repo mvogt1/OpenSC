@@ -127,6 +127,7 @@ struct pcsc_global_private_data {
 	int enable_pinpad;
 	int fixed_pinlength;
 	int enable_pace;
+	int state_proxy;
 	size_t force_max_recv_size;
 	size_t force_max_send_size;
 	int connect_exclusive;
@@ -911,6 +912,8 @@ static int pcsc_init(sc_context_t *ctx)
 				gpriv->fixed_pinlength);
 		gpriv->enable_pace = scconf_get_bool(conf_block, "enable_pace",
 				gpriv->enable_pace);
+		gpriv->state_proxy = scconf_get_bool(conf_block, "state_proxy",
+				gpriv->state_proxy);
 		gpriv->force_max_send_size = scconf_get_int(conf_block,
 				"max_send_size", (int)gpriv->force_max_send_size);
 		gpriv->force_max_recv_size = scconf_get_int(conf_block,
@@ -996,6 +999,18 @@ static int pcsc_init(sc_context_t *ctx)
 	}
 
 	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus);
+	if (gpriv->state_proxy) {
+		gpriv->proxy.SCardEstablishContext = gpriv->SCardEstablishContext;
+		gpriv->proxy.SCardReleaseContext = gpriv->SCardReleaseContext;
+		gpriv->proxy.SCardListReaders = gpriv->SCardListReaders;
+		gpriv->proxy.SCardCancel = gpriv->SCardCancel;
+		if (gpriv->cardmod)
+			sc_log(ctx, "state_proxy not used with cardmod");
+		else if (ctx->flags & SC_CTX_FLAG_NO_THREADS)
+			sc_log(ctx, "state_proxy needs a thread, the application does not allow it");
+		else if (pcsc_proxy_start_monitor(&gpriv->proxy) != SC_SUCCESS)
+			sc_log(ctx, "state_proxy could not be started");
+	}
 
 	ctx->reader_drv_data = gpriv;
 	gpriv = NULL;
