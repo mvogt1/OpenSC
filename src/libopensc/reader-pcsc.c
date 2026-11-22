@@ -38,6 +38,7 @@
 #include "common/libscdl.h"
 #include "internal.h"
 #include "internal-winscard.h"
+#include "reader-pcsc-proxy.h"
 #include "card-sc-hsm.h"
 
 #include "pace.h"
@@ -149,6 +150,8 @@ struct pcsc_global_private_data {
 	SCardTransmit_t SCardTransmit;
 	SCardListReaders_t SCardListReaders;
 	SCardGetAttrib_t SCardGetAttrib;
+	/* SCardGetStatusChange and SCardStatus are called through the proxy */
+	struct pcsc_proxy proxy;
 
 	sc_reader_t *attached_reader;
 	sc_reader_t *removed_reader;
@@ -401,7 +404,7 @@ static int refresh_attributes(sc_reader_t *reader)
 		priv->reader_state.dwCurrentState = priv->reader_state.dwEventState;
 	}
 
-	rv = priv->gpriv->SCardGetStatusChange(priv->gpriv->pcsc_ctx, 0, &priv->reader_state, 1);
+	rv = pcsc_proxy_SCardGetStatusChange(&priv->gpriv->proxy, priv->gpriv->pcsc_ctx, 0, &priv->reader_state, 1);
 
 	if (rv != SCARD_S_SUCCESS) {
 		if (rv == (LONG)SCARD_E_TIMEOUT) {
@@ -420,7 +423,7 @@ static int refresh_attributes(sc_reader_t *reader)
 				DWORD readers_len = 0, cstate = 0, prot, atr_len = SC_MAX_ATR_SIZE;
 				/* When reader is removed between two subsequent calls to refresh_attributes,
 				 * SCardGetStatusChange does not notice the change, test the card handle with SCardStatus */
-				rv = priv->gpriv->SCardStatus(priv->pcsc_card, NULL, &readers_len, &cstate, &prot, atr, &atr_len);
+				rv = pcsc_proxy_SCardStatus(&priv->gpriv->proxy, priv->pcsc_card, NULL, &readers_len, &cstate, &prot, atr, &atr_len);
 				if (rv != (LONG)SCARD_S_SUCCESS)
 					reader->flags |= SC_READER_CARD_CHANGED;
 				/* If this happens, card must be reconnected, otherwise SCardGetStatusChange() will still return timeout
@@ -497,7 +500,7 @@ static int refresh_attributes(sc_reader_t *reader)
 				 * the handle will be invalid. */
 				DWORD readers_len = 0, cstate, prot, atr_len = SC_MAX_ATR_SIZE;
 				unsigned char atr[SC_MAX_ATR_SIZE];
-				rv = priv->gpriv->SCardStatus(priv->pcsc_card, NULL,
+				rv = pcsc_proxy_SCardStatus(&priv->gpriv->proxy, priv->pcsc_card, NULL,
 						&readers_len, &cstate, &prot, atr, &atr_len);
 				if (rv == (LONG)SCARD_W_REMOVED_CARD || rv == (LONG)SCARD_E_INVALID_VALUE)
 					reader->flags |= SC_READER_CARD_CHANGED;
@@ -992,6 +995,8 @@ static int pcsc_init(sc_context_t *ctx)
 		goto out;
 	}
 
+	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus);
+
 	ctx->reader_drv_data = gpriv;
 	gpriv = NULL;
 	ret = SC_SUCCESS;
@@ -1014,6 +1019,7 @@ static int pcsc_finish(sc_context_t *ctx)
 	LOG_FUNC_CALLED(ctx);
 
 	if (gpriv) {
+		pcsc_proxy_finish(&gpriv->proxy);
 		if (!gpriv->cardmod && gpriv->pcsc_ctx != (SCARDCONTEXT)-1 &&
 				!(ctx->flags & SC_CTX_FLAG_TERMINATE))
 			gpriv->SCardReleaseContext(gpriv->pcsc_ctx);
@@ -1796,7 +1802,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 		goto out;
 	}
 
-	rv = gpriv->SCardGetStatusChange(gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], 0, states->reader_states, num_watch);
+	rv = pcsc_proxy_SCardGetStatusChange(&gpriv->proxy, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], 0, states->reader_states, num_watch);
 	if (rv != SCARD_S_SUCCESS) {
 		if (rv != (LONG)SCARD_E_TIMEOUT) {
 			PCSC_LOG(ctx, "SCardGetStatusChange(1) failed", rv);
@@ -1903,7 +1909,7 @@ static int pcsc_wait_for_event(sc_context_t *ctx, unsigned int event_mask, sc_re
 		else
 			dwtimeout = timeout;
 
-		rv = gpriv->SCardGetStatusChange(gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], dwtimeout, states->reader_states, num_watch);
+		rv = pcsc_proxy_SCardGetStatusChange(&gpriv->proxy, gpriv->pcsc_wait_ctx[states->pcsc_wait_ctx_index], dwtimeout, states->reader_states, num_watch);
 
 		if (rv == (LONG)SCARD_E_CANCELLED) {
 			/* pcsc_cancel was called, events don't matter */
@@ -2642,7 +2648,7 @@ static void detect_protocol(sc_reader_t *reader, SCARDHANDLE card_handle)
 	unsigned char atr[SC_MAX_ATR_SIZE];
 	struct pcsc_private_data *priv = reader->drv_data;
 	/* attempt to detect protocol in use T0/T1/RAW */
-	DWORD rv = priv->gpriv->SCardStatus(card_handle, NULL,
+	DWORD rv = pcsc_proxy_SCardStatus(&priv->gpriv->proxy, card_handle, NULL,
 			&readers_len, &state, &prot, atr, &atr_len);
 	if (rv != SCARD_S_SUCCESS) {
 		prot = SCARD_PROTOCOL_T0;
