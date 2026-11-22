@@ -128,6 +128,7 @@ struct pcsc_global_private_data {
 	int fixed_pinlength;
 	int enable_pace;
 	int state_proxy;
+	int state_proxy_tried;	/* pcsc_start_proxy() was called */
 	/* Start the PC/SC transaction (SCardBeginTransaction) only when the
 	 * first command is sent to the card, not already in sc_lock(). Locked
 	 * sections that are served from caches then cause no PC/SC calls.
@@ -1060,16 +1061,9 @@ static int pcsc_init(sc_context_t *ctx)
 
 	pcsc_proxy_init(&gpriv->proxy, ctx, gpriv->SCardGetStatusChange, gpriv->SCardStatus,
 			gpriv->SCardListReaders, gpriv->SCardCancel);
-	if (gpriv->state_proxy) {
-		gpriv->proxy.SCardEstablishContext = gpriv->SCardEstablishContext;
-		gpriv->proxy.SCardReleaseContext = gpriv->SCardReleaseContext;
-		if (gpriv->cardmod)
-			sc_log(ctx, "state_proxy not used with cardmod");
-		else if (ctx->flags & SC_CTX_FLAG_NO_THREADS)
-			sc_log(ctx, "state_proxy needs a thread, the application does not allow it");
-		else if (pcsc_proxy_start_monitor(&gpriv->proxy) != SC_SUCCESS)
-			sc_log(ctx, "state_proxy could not be started");
-	}
+	gpriv->proxy.SCardEstablishContext = gpriv->SCardEstablishContext;
+	gpriv->proxy.SCardReleaseContext = gpriv->SCardReleaseContext;
+	/* the monitor is started by pcsc_start_proxy() */
 
 	ctx->reader_drv_data = gpriv;
 	gpriv = NULL;
@@ -1085,6 +1079,26 @@ out:
 	return ret;
 }
 
+
+/* Start the monitor of state_proxy, once, after gpriv->pcsc_ctx is established.
+ *
+ * Not earlier: the monitor thread establishes its own context, and
+ * pcsc-lite (seen with 2.3.1) fails the first SCardEstablishContext() calls
+ * of a process with SCARD_F_INTERNAL_ERROR when two threads make them at
+ * the same time.  Once one context exists, more contexts can be established
+ * from several threads. */
+static void pcsc_start_proxy(sc_context_t *ctx, struct pcsc_global_private_data *gpriv)
+{
+	if (!gpriv->state_proxy || gpriv->state_proxy_tried)
+		return;
+	gpriv->state_proxy_tried = 1;
+	if (gpriv->cardmod)
+		sc_log(ctx, "state_proxy not used with cardmod");
+	else if (ctx->flags & SC_CTX_FLAG_NO_THREADS)
+		sc_log(ctx, "state_proxy needs a thread, the application does not allow it");
+	else if (pcsc_proxy_start_monitor(&gpriv->proxy) != SC_SUCCESS)
+		sc_log(ctx, "state_proxy could not be started");
+}
 
 static int pcsc_finish(sc_context_t *ctx)
 {
@@ -1616,6 +1630,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 				ret = pcsc_to_opensc_error(rv);
 				goto out;
 			}
+			pcsc_start_proxy(ctx, gpriv);
 
 			/* try to fetch the list of readers again */
 			rv = SCARD_E_INVALID_HANDLE;

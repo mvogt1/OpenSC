@@ -106,6 +106,7 @@ struct pcsc_proxy_monitor {
 	int valid;	/* the copy is the current PC/SC state */
 	int stop;
 	int exited;
+	int ctx_ready;	/* mon_ctx is established, SCardCancel() can use it */
 	size_t count;
 	struct monitor_entry entry[MONITOR_MAX_READERS];
 	DWORD pnp_state;
@@ -180,11 +181,45 @@ static void monitor_list_readers(struct pcsc_proxy_monitor *mon)
 	sc_log(mon->proxy->ctx, "pcsc proxy: watching %zu reader%s", n, n == 1 ? "" : "s");
 }
 
+/* wait up to ms for a signal on mon->changed, called with the lock held */
+static void monitor_cond_wait_ms(struct pcsc_proxy_monitor *mon, long ms)
+{
+	struct timespec deadline;
+
+	clock_gettime(CLOCK_MONOTONIC, &deadline);
+	deadline.tv_nsec += ms * 1000 * 1000;
+	if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000 * 1000 * 1000;
+	}
+	pthread_cond_timedwait(&mon->changed, &mon->lock, &deadline);
+}
+
 static void *monitor_thread(void *arg)
 {
 	struct pcsc_proxy_monitor *mon = arg;
 	int idle = 0;
 	LONG rv;
+
+	/* The context is established here and not in pcsc_proxy_start_monitor():
+	 * SCardEstablishContext() costs two round trips to pcscd with
+	 * pcsc-lite.  Done in the thread, the caller does not wait for it;
+	 * until the first copy is ready, every call goes to PC/SC.
+	 * The caller must have established a context before, see
+	 * pcsc_start_proxy() in reader-pcsc.c. */
+	rv = mon->proxy->SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &mon->mon_ctx);
+	pthread_mutex_lock(&mon->lock);
+	if (rv == SCARD_S_SUCCESS)
+		mon->ctx_ready = 1;
+	else
+		mon->exited = 1;
+	pthread_cond_broadcast(&mon->changed);
+	pthread_mutex_unlock(&mon->lock);
+	if (rv != SCARD_S_SUCCESS) {
+		sc_log(mon->proxy->ctx, "pcsc proxy: SCardEstablishContext failed: 0x%08lx",
+				(unsigned long)rv);
+		return NULL;
+	}
 
 	monitor_list_readers(mon);
 
@@ -525,7 +560,6 @@ static int monitor_list_answer(struct pcsc_proxy_monitor *mon,
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 {
 	struct pcsc_proxy_monitor *mon;
-	LONG rv;
 
 	mon = calloc(1, sizeof *mon);
 	if (mon == NULL)
@@ -552,26 +586,17 @@ int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
 		}
 	}
 
-	rv = proxy->SCardEstablishContext(SCARD_SCOPE_USER, NULL, NULL, &mon->mon_ctx);
-	if (rv != SCARD_S_SUCCESS) {
-		sc_log(proxy->ctx, "pcsc proxy: SCardEstablishContext failed: 0x%08lx",
-				(unsigned long)rv);
-		goto err;
-	}
+	/* the thread establishes its own context, see monitor_thread() */
 	if (pthread_create(&mon->thread, NULL, monitor_thread, mon) != 0) {
 		sc_log(proxy->ctx, "pcsc proxy: cannot create thread");
-		proxy->SCardReleaseContext(mon->mon_ctx);
-		goto err;
+		pthread_cond_destroy(&mon->changed);
+		pthread_mutex_destroy(&mon->lock);
+		free(mon);
+		return SC_ERROR_INTERNAL;
 	}
 	proxy->monitor = mon;
 	sc_log(proxy->ctx, "pcsc proxy: monitor started");
 	return SC_SUCCESS;
-
-err:
-	pthread_cond_destroy(&mon->changed);
-	pthread_mutex_destroy(&mon->lock);
-	free(mon);
-	return SC_ERROR_INTERNAL;
 }
 
 static void monitor_stop(struct pcsc_proxy *proxy)
@@ -594,23 +619,33 @@ static void monitor_stop(struct pcsc_proxy *proxy)
 
 	/* SCardCancel only stops a running wait, so repeat it until the
 	 * thread has noticed the stop flag; the callers must have left the
-	 * proxy before mon is freed */
-	for (i = 0; i < 200 && !exited; i++) {
-		pthread_mutex_lock(&mon->lock);
+	 * proxy before mon is freed.
+	 * The waits are on mon->changed, not a fixed sleep: the thread and the
+	 * callers signal it when they leave, so this returns as soon as they
+	 * are gone.  A sleep of 10 ms per round made every process exit at
+	 * least 10 ms later.  The 10 ms timeout only repeats SCardCancel()
+	 * for a cancel that came before the thread started its wait. */
+	pthread_mutex_lock(&mon->lock);
+	for (i = 0; i < 200; i++) {
 		exited = mon->exited;
-		pthread_mutex_unlock(&mon->lock);
-		if (!exited) {
+		if (exited)
+			break;
+		if (mon->ctx_ready) {
+			pthread_mutex_unlock(&mon->lock);
 			proxy->SCardCancel(mon->mon_ctx);
-			monitor_sleep_ms(10);
+			pthread_mutex_lock(&mon->lock);
+			if (mon->exited)
+				continue;
 		}
+		monitor_cond_wait_ms(mon, 10);
 	}
-	for (; i < 200 && !idle; i++) {
-		pthread_mutex_lock(&mon->lock);
+	for (; i < 200; i++) {
 		idle = mon->waiters == NULL && mon->real_waits == 0;
-		pthread_mutex_unlock(&mon->lock);
-		if (!idle)
-			monitor_sleep_ms(10);
+		if (idle)
+			break;
+		monitor_cond_wait_ms(mon, 10);
 	}
+	pthread_mutex_unlock(&mon->lock);
 	if (!exited || !idle) {
 		/* do not hang the application, leave the thread behind */
 		sc_log(proxy->ctx, "pcsc proxy: monitor does not stop");
@@ -621,7 +656,8 @@ static void monitor_stop(struct pcsc_proxy *proxy)
 		return;
 	}
 	pthread_join(mon->thread, NULL);
-	proxy->SCardReleaseContext(mon->mon_ctx);
+	if (mon->ctx_ready)
+		proxy->SCardReleaseContext(mon->mon_ctx);
 	pthread_cond_destroy(&mon->changed);
 	pthread_mutex_destroy(&mon->lock);
 	free(mon);

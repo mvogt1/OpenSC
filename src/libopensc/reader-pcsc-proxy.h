@@ -52,7 +52,10 @@ void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
 		SCardListReaders_t list_readers, SCardCancel_t cancel);
 /* start the thread that answers SCardGetStatusChange(), repeated
  * SCardStatus() and SCardListReaders() calls, needs the
- * SCardEstablishContext and SCardReleaseContext members to be set */
+ * SCardEstablishContext and SCardReleaseContext members to be set.
+ * Call it only after the process has established a PC/SC context: the
+ * thread establishes its own one, and pcsc-lite fails concurrent first
+ * SCardEstablishContext() calls. */
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy);
 void pcsc_proxy_finish(struct pcsc_proxy *proxy);
 /* the card handle was disconnected, reconnected or a call on it failed:
