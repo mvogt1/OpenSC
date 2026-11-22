@@ -290,6 +290,8 @@ static int pcsc_internal_transmit(sc_reader_t *reader,
 	if (!control) {
 		rv = priv->gpriv->SCardTransmit(card, &sSendPci, sendbuf, dwSendLength,
 				   &sRecvPci, recvbuf, &dwRecvLength);
+		if (rv != SCARD_S_SUCCESS)
+			pcsc_proxy_card_forget(&priv->gpriv->proxy, card);
 	} else {
 		if (priv->gpriv->SCardControlOLD) {
 			rv = priv->gpriv->SCardControlOLD(card, sendbuf, dwSendLength,
@@ -607,6 +609,7 @@ static int pcsc_reconnect(sc_reader_t * reader, DWORD action)
 	priv->locked = 0;
 #endif
 
+	pcsc_proxy_card_forget(&priv->gpriv->proxy, priv->pcsc_card);
 	rv = priv->gpriv->SCardReconnect(priv->pcsc_card,
 			priv->gpriv->connect_exclusive ? SCARD_SHARE_EXCLUSIVE : SCARD_SHARE_SHARED,
 			protocol, action, &active_proto);
@@ -681,6 +684,8 @@ static int pcsc_connect(sc_reader_t *reader)
 		}
 
 		reader->active_protocol = pcsc_proto_to_opensc(active_proto);
+		/* a new handle can have the value of a disconnected one */
+		pcsc_proxy_card_forget(&priv->gpriv->proxy, card_handle);
 		priv->pcsc_card = card_handle;
 
 		initialize_uid(reader);
@@ -716,7 +721,10 @@ static int pcsc_disconnect(sc_reader_t * reader)
 	struct pcsc_private_data *priv = reader->drv_data;
 
 	if (!priv->gpriv->cardmod && !(reader->ctx->flags & SC_CTX_FLAG_TERMINATE)) {
-		LONG rv = priv->gpriv->SCardDisconnect(priv->pcsc_card, priv->gpriv->disconnect_action);
+		LONG rv;
+
+		pcsc_proxy_card_forget(&priv->gpriv->proxy, priv->pcsc_card);
+		rv = priv->gpriv->SCardDisconnect(priv->pcsc_card, priv->gpriv->disconnect_action);
 		PCSC_TRACE(reader, "SCardDisconnect returned", rv);
 		if (rv == SCARD_S_SUCCESS) {
 			// Card was successfully disconnected, reset the card handle
@@ -1641,6 +1649,7 @@ static int pcsc_detect_readers(sc_context_t *ctx)
 
 		if (rv == SCARD_S_SUCCESS) {
 			detect_reader_features(reader, card_handle);
+			pcsc_proxy_card_forget(&gpriv->proxy, card_handle);
 			gpriv->SCardDisconnect(card_handle, SCARD_LEAVE_CARD);
 		}
 	}

@@ -45,6 +45,12 @@
  * The monitor thread waits in SCardGetStatusChange(INFINITE) on its own
  * context for changes of all readers and keeps a copy of their states.
  * A poll (timeout 0) is answered from this copy like PC/SC would do it.
+ *
+ * SCardStatus() goes to PC/SC once per card handle, its result is kept and
+ * returned again as long as the monitor has seen no change of any reader
+ * since then.  A card reset by another application changes no reader
+ * state, it is noticed by the next call on the card (SCARD_W_RESET_CARD).
+ *
  * Every call the copy cannot answer goes to PC/SC.
  */
 
@@ -55,6 +61,20 @@
 struct monitor_entry {
 	char name[MONITOR_NAME_LEN];
 	DWORD state;
+	DWORD cbAtr;
+	unsigned char rgbAtr[MAX_ATR_SIZE];
+};
+
+#define MONITOR_MAX_CARDS 16
+
+/* result of the last successful SCardStatus() of a card handle */
+struct monitor_card {
+	SCARDHANDLE hCard;
+	int used;
+	unsigned long generation;	/* of the copy at the time of the call */
+	DWORD readers_len;
+	DWORD state;
+	DWORD protocol;
 	DWORD cbAtr;
 	unsigned char rgbAtr[MAX_ATR_SIZE];
 };
@@ -73,6 +93,9 @@ struct pcsc_proxy_monitor {
 	size_t count;
 	struct monitor_entry entry[MONITOR_MAX_READERS];
 	DWORD pnp_state;
+	/* counts the changes the thread has seen */
+	unsigned long generation;
+	struct monitor_card card[MONITOR_MAX_CARDS];
 
 	/* used by the thread only */
 	size_t nwatch;	/* readers in watch[], without PnP */
@@ -123,6 +146,7 @@ static void monitor_list_readers(struct pcsc_proxy_monitor *mon)
 	/* the copy is not valid until the next wait has returned */
 	pthread_mutex_lock(&mon->lock);
 	mon->valid = 0;
+	mon->generation++;
 	pthread_mutex_unlock(&mon->lock);
 
 	sc_log(mon->proxy->ctx, "pcsc proxy: watching %zu reader%s", n, n == 1 ? "" : "s");
@@ -192,6 +216,8 @@ static void *monitor_thread(void *arg)
 			memcpy(e->rgbAtr, rs->rgbAtr, e->cbAtr);
 		}
 		mon->pnp_state = mon->watch[mon->nwatch].dwCurrentState;
+		if (changed || rebuild)
+			mon->generation++;
 		mon->valid = !rebuild;
 		pthread_mutex_unlock(&mon->lock);
 
@@ -270,6 +296,71 @@ static int monitor_answer(struct pcsc_proxy_monitor *mon,
 	if (answered)
 		*rv = changed ? SCARD_S_SUCCESS : (LONG)SCARD_E_TIMEOUT;
 	return answered;
+}
+
+static struct monitor_card *monitor_card_find(struct pcsc_proxy_monitor *mon, SCARDHANDLE hCard)
+{
+	size_t i;
+
+	for (i = 0; i < MONITOR_MAX_CARDS; i++)
+		if (mon->card[i].used && mon->card[i].hCard == hCard)
+			return &mon->card[i];
+	return NULL;
+}
+
+/* answer SCardStatus() from the kept result, 0 if it cannot be used */
+static int monitor_status_answer(struct pcsc_proxy_monitor *mon, SCARDHANDLE hCard,
+		LPDWORD pcchReaderLen, LPDWORD pdwState, LPDWORD pdwProtocol,
+		LPBYTE pbAtr, LPDWORD pcbAtrLen)
+{
+	struct monitor_card *card;
+	int answered = 0;
+
+	pthread_mutex_lock(&mon->lock);
+	card = monitor_card_find(mon, hCard);
+	if (card && mon->valid && card->generation == mon->generation) {
+		*pcchReaderLen = card->readers_len;
+		if (pdwState)
+			*pdwState = card->state;
+		if (pdwProtocol)
+			*pdwProtocol = card->protocol;
+		*pcbAtrLen = card->cbAtr;
+		memcpy(pbAtr, card->rgbAtr, card->cbAtr);
+		answered = 1;
+	} else if (card) {
+		card->used = 0;
+	}
+	pthread_mutex_unlock(&mon->lock);
+	return answered;
+}
+
+/* keep a successful SCardStatus() result, generation is the one of the copy
+ * before the call */
+static void monitor_status_keep(struct pcsc_proxy_monitor *mon, SCARDHANDLE hCard,
+		unsigned long generation, DWORD readers_len, DWORD state, DWORD protocol,
+		const BYTE *atr, DWORD atr_len)
+{
+	struct monitor_card *card;
+	size_t i;
+
+	if (atr_len > MAX_ATR_SIZE)
+		return;
+	pthread_mutex_lock(&mon->lock);
+	card = monitor_card_find(mon, hCard);
+	for (i = 0; card == NULL && i < MONITOR_MAX_CARDS; i++)
+		if (!mon->card[i].used)
+			card = &mon->card[i];
+	if (card == NULL)
+		card = &mon->card[0];	/* full, replace one */
+	card->hCard = hCard;
+	card->used = 1;
+	card->generation = generation;
+	card->readers_len = readers_len;
+	card->state = state;
+	card->protocol = protocol;
+	card->cbAtr = atr_len;
+	memcpy(card->rgbAtr, atr, atr_len);
+	pthread_mutex_unlock(&mon->lock);
 }
 
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy)
@@ -389,12 +480,70 @@ LONG pcsc_proxy_SCardGetStatusChange(struct pcsc_proxy *proxy, SCARDCONTEXT hCon
 	return proxy->SCardGetStatusChange(hContext, dwTimeout, rgReaderStates, cReaders);
 }
 
+void pcsc_proxy_card_forget(struct pcsc_proxy *proxy, SCARDHANDLE hCard)
+{
+#ifdef HAVE_PCSC_PROXY_MONITOR
+	struct pcsc_proxy_monitor *mon = proxy->monitor;
+	struct monitor_card *card;
+
+	if (mon == NULL || mon->pid != getpid())
+		return;
+	pthread_mutex_lock(&mon->lock);
+	card = monitor_card_find(mon, hCard);
+	if (card)
+		card->used = 0;
+	pthread_mutex_unlock(&mon->lock);
+#else
+	(void)proxy;
+	(void)hCard;
+#endif
+}
+
 LONG pcsc_proxy_SCardStatus(struct pcsc_proxy *proxy, SCARDHANDLE hCard,
 		LPSTR mszReaderNames, LPDWORD pcchReaderLen, LPDWORD pdwState,
 		LPDWORD pdwProtocol, LPBYTE pbAtr, LPDWORD pcbAtrLen)
 {
+#ifdef HAVE_PCSC_PROXY_MONITOR
+	struct pcsc_proxy_monitor *mon = proxy->monitor;
+	DWORD state = 0, protocol = 0;
+	unsigned long generation;
+	int valid;
+	LONG rv;
+
+	/* only the calls of reader-pcsc.c: no reader names, ATR buffer of
+	 * full size */
+	if (mon == NULL || mon->pid != getpid() || mszReaderNames != NULL
+			|| pcchReaderLen == NULL || pbAtr == NULL || pcbAtrLen == NULL
+			|| *pcbAtrLen < MAX_ATR_SIZE)
+		return proxy->SCardStatus(hCard, mszReaderNames, pcchReaderLen, pdwState,
+				pdwProtocol, pbAtr, pcbAtrLen);
+
+	if (monitor_status_answer(mon, hCard, pcchReaderLen, pdwState, pdwProtocol,
+				pbAtr, pcbAtrLen)) {
+		sc_log(proxy->ctx, "pcsc proxy: SCardStatus answered");
+		return SCARD_S_SUCCESS;
+	}
+
+	/* a change seen during the call makes the result old at once */
+	pthread_mutex_lock(&mon->lock);
+	valid = mon->valid;
+	generation = mon->generation;
+	pthread_mutex_unlock(&mon->lock);
+
+	rv = proxy->SCardStatus(hCard, NULL, pcchReaderLen, &state, &protocol,
+			pbAtr, pcbAtrLen);
+	if (pdwState)
+		*pdwState = state;
+	if (pdwProtocol)
+		*pdwProtocol = protocol;
+	if (rv == SCARD_S_SUCCESS && valid)
+		monitor_status_keep(mon, hCard, generation, *pcchReaderLen, state,
+				protocol, pbAtr, *pcbAtrLen);
+	return rv;
+#else
 	return proxy->SCardStatus(hCard, mszReaderNames, pcchReaderLen, pdwState,
 			pdwProtocol, pbAtr, pcbAtrLen);
+#endif
 }
 
 #endif   /* ENABLE_PCSC */

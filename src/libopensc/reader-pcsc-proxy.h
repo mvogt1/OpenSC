@@ -48,11 +48,15 @@ struct pcsc_proxy {
 
 void pcsc_proxy_init(struct pcsc_proxy *proxy, sc_context_t *ctx,
 		SCardGetStatusChange_t get_status_change, SCardStatus_t status);
-/* start the thread that answers SCardGetStatusChange() polls, needs the
+/* start the thread that answers SCardGetStatusChange() polls and repeated
+ * SCardStatus() calls, needs the
  * SCardEstablishContext, SCardReleaseContext, SCardListReaders and
  * SCardCancel members to be set */
 int pcsc_proxy_start_monitor(struct pcsc_proxy *proxy);
 void pcsc_proxy_finish(struct pcsc_proxy *proxy);
+/* the card handle was disconnected, reconnected or a call on it failed:
+ * do not answer SCardStatus() for it from the copy any more */
+void pcsc_proxy_card_forget(struct pcsc_proxy *proxy, SCARDHANDLE hCard);
 
 LONG pcsc_proxy_SCardGetStatusChange(struct pcsc_proxy *proxy, SCARDCONTEXT hContext,
 		DWORD dwTimeout, SCARD_READERSTATE *rgReaderStates, DWORD cReaders);
